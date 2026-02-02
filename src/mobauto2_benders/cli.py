@@ -271,6 +271,23 @@ def cmd_run(args) -> int:
     solver = BendersSolver(master, sub, cfg)
     _print_cfg(mp, sp)
     result = solver.run()
+    # Optional final summary using last subproblem diagnostics
+    try:
+        if result.pax_served is not None and result.pax_total is not None:
+            print(f"Pax served: {result.pax_served:.0f}/{result.pax_total:.0f}")
+            # Compute penalization and waiting time per served pax if we have a solution value
+            p_pen = sp.get("p", None)
+            sol_val = result.best_upper_bound
+            if p_pen is not None and sol_val is not None and result.pax_served > 0:
+                penalized = max(0.0, float(result.pax_total) - float(result.pax_served))
+                pen_cost = penalized * float(p_pen)
+                wait_per_pax = (float(sol_val) - pen_cost) / float(result.pax_served)
+                print(
+                    "Solution: %.6g. Penalized pax: %.0f. Penalization: %.0f * %.6g = %.6g. Waiting time: %.6g"
+                    % (float(sol_val), penalized, penalized, float(p_pen), pen_cost, wait_per_pax)
+                )
+    except Exception:
+        pass
     print(
         f"\nResult: status={result.status} iterations={result.iterations} "
         f"best_lb={result.best_lower_bound} best_ub={result.best_upper_bound}"

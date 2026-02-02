@@ -26,12 +26,12 @@ master:
     use_lazy_cuts: true
     # Print the underlying solver's log during each MP solve
     solver_tee: false
-    # (Optional) CPLEX tuning can go here; keeping defaults for stability
+
     # Q: number of vehicles modeled in the master
     Q: 2
     # Time discretization is defined in minutes; slots are implicit via slot_resolution.
     # T_minutes: total horizon length in minutes (e.g., 600)
-    T_minutes: 660
+    T_minutes: 810
     # slot_resolution: minutes per slot (e.g., 5 -> discrete time grid every 5 minutes)
     slot_resolution: 30
     # trip_duration_minutes: physical trip duration in minutes. Internally converted to slots as ceil(trip_duration_minutes / slot_resolution).
@@ -52,7 +52,7 @@ master:
     # Optional: enable FIFO symmetry-breaking across vehicles (off by default)
     use_fifo_symmetry: true
     # delta_chg: maximum charge added per slot when c[q,t] = 1
-    delta_chg: 30 / (30 / slot_resolution)
+    delta_chg: 70 / (60 / slot_resolution)
     # Use one theta per scenario (requires subproblem multi_cuts_by_scenario and scenario count)
     theta_per_scenario: true
     # Stronger Benders cuts (set to false to use per-(q,t) coefficients)
@@ -74,7 +74,7 @@ subproblem:
     #   multi_cuts_by_scenario: false -> a single cut averaged across scenarios
     multi_cuts_by_scenario: true
     # Magnanti–Wong selection for Pareto-optimal cuts (uses core point xbar)
-    use_magnanti_wong: false
+    use_magnanti_wong: true
     # Core-point mixing factor alpha in (0,1]
     mw_core_alpha: 0.3
     # Use dual slopes (supporting hyperplanes ensure tight envelope)
@@ -82,7 +82,7 @@ subproblem:
     # (Optional) LP tuning can go here; keeping defaults for stability
     # S: capacity units contributed by one vehicle starting at time tau.
     #   Master yOUT[q,tau] adds S to C_out[tau] (similarly for yRET/C_ret).
-    S: 5
+    S: 15
     # Wmax can be given in slots or minutes. If Wmax_minutes is provided, it is converted to slots using slot_resolution
     # of the master params.
     Wmax_minutes: 30
@@ -103,7 +103,7 @@ subproblem:
     #       { req_matrix: [[OUT|RET|0|1, time], ...] }
     #       { R_out: [...], R_ret: [...] }
     #  - scenario_files: list of files (each as above) for multi-scenario runs
-    demand_file: setups/demo_cont_demand.yaml
+    demand_file: setups/random.yaml
     #scenario_files:
     #   - setups/demo_cont_demand_simpler.yaml
     #   - setups/demo_cont_demand_simpler2.yaml

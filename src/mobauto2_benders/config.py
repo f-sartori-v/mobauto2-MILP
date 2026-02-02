@@ -79,7 +79,8 @@ def _eval_expr(expr: str, names: Mapping[str, Any]) -> float | int:
             if isinstance(n.value, (int, float)):
                 return n.value
             raise ValueError("non-numeric constant in expression")
-        if isinstance(n, ast.Num):  # pragma: no cover - for older Python ASTs
+        num_node = getattr(ast, "Num", None)  # Python < 3.12 compatibility
+        if num_node is not None and isinstance(n, num_node):  # pragma: no cover - old ASTs
             return n.n  # type: ignore[attr-defined]
         if isinstance(n, ast.Name):
             if n.id not in names:

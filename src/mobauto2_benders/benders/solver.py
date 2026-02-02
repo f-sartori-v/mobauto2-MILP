@@ -164,6 +164,8 @@ class BendersRunResult:
     iterations: int
     best_lower_bound: Optional[float]
     best_upper_bound: Optional[float]
+    pax_served: Optional[float] = None
+    pax_total: Optional[float] = None
 
 
 class BendersSolver:
@@ -178,6 +180,49 @@ class BendersSolver:
         tol = self.cfg.run.tolerance
         self.master.initialize()
         print("Initialized master problem.")
+
+        last_pax_served: Optional[float] = None
+        last_pax_total: Optional[float] = None
+
+        def _calc_pax_totals_from_diag(diag: dict | None) -> tuple[Optional[float], Optional[float]]:
+            if not isinstance(diag, dict):
+                return None, None
+            scenarios = diag.get("scenarios")
+            if isinstance(scenarios, list) and scenarios:
+                weights = diag.get("scenario_weights")
+                served_vals = []
+                total_vals = []
+                for sdiag in scenarios:
+                    try:
+                        R_out = sdiag.get("R_out") or []
+                        R_ret = sdiag.get("R_ret") or []
+                        pax_out = sdiag.get("pax_out_by_tau") or []
+                        pax_ret = sdiag.get("pax_ret_by_tau") or []
+                        total = float(sum(R_out) + sum(R_ret))
+                        served = float(sum(pax_out) + sum(pax_ret))
+                        total_vals.append(total)
+                        served_vals.append(served)
+                    except Exception:
+                        continue
+                if not served_vals or not total_vals:
+                    return None, None
+                if isinstance(weights, list) and len(weights) == len(served_vals):
+                    served_w = sum(float(w) * s for w, s in zip(weights, served_vals))
+                    total_w = sum(float(w) * t for w, t in zip(weights, total_vals))
+                    return served_w, total_w
+                # Default to simple average if weights missing
+                n = float(len(served_vals))
+                return sum(served_vals) / n, sum(total_vals) / n
+            try:
+                R_out = diag.get("R_out") or []
+                R_ret = diag.get("R_ret") or []
+                pax_out = diag.get("pax_out_by_tau") or []
+                pax_ret = diag.get("pax_ret_by_tau") or []
+                total = float(sum(R_out) + sum(R_ret))
+                served = float(sum(pax_out) + sum(pax_ret))
+                return served, total
+            except Exception:
+                return None, None
 
         # Helper: print diagnostics from the most recent subproblem evaluation
         def _print_sp_diagnostics(diag: dict | None) -> None:
@@ -280,8 +325,17 @@ class BendersSolver:
                                 pass
                         except Exception:
                             pass
+                        try:
+                            if isinstance(pax_out, list) and isinstance(pax_ret, list) and isinstance(R_out, list) and isinstance(R_ret, list):
+                                served = float(sum(pax_out) + sum(pax_ret))
+                                total = float(sum(R_out) + sum(R_ret))
+                                print(f"Pax served: {served:.0f}/{total:.0f}")
+                        except Exception:
+                            pass
                     except Exception:
                         continue
+                nonlocal last_pax_served, last_pax_total
+                last_pax_served, last_pax_total = _calc_pax_totals_from_diag(diag)
                 return
             # Single-scenario path (legacy)
             try:
@@ -319,10 +373,17 @@ class BendersSolver:
                             print(header)
                             for q in Q:
                                 print(f"  q={q}: {_fmt_row(served_qt[q], T)}")
+                            try:
+                                served = float(sum(pax_out) + sum(pax_ret))
+                                total = float(sum(R_out) + sum(R_ret))
+                                print(f"Pax served: {served:.0f}/{total:.0f}")
+                            except Exception:
+                                pass
                     except Exception:
                         pass
             except Exception:
                 pass
+            last_pax_served, last_pax_total = _calc_pax_totals_from_diag(diag)
 
         # Optionally install lazy constraints callback if supported
         use_lazy = bool(self.cfg.master.params.get("use_lazy_cuts", False))
@@ -386,6 +447,8 @@ class BendersSolver:
                     iterations=it - 1,
                     best_lower_bound=best_lb,
                     best_upper_bound=best_ub,
+                    pax_served=last_pax_served,
+                    pax_total=last_pax_total,
                 )
 
             print(f"\n=== Iteration {it} ===")
@@ -432,6 +495,8 @@ class BendersSolver:
                     iterations=it,
                     best_lower_bound=best_lb,
                     best_upper_bound=best_ub,
+                    pax_served=last_pax_served,
+                    pax_total=last_pax_total,
                 )
 
             # Update lower bound if provided
@@ -445,6 +510,8 @@ class BendersSolver:
                     iterations=it,
                     best_lower_bound=best_lb,
                     best_upper_bound=best_ub,
+                    pax_served=last_pax_served,
+                    pax_total=last_pax_total,
                 )
 
             # Optional: update and pass a core point for Magnanti–Wong selection
@@ -609,6 +676,8 @@ class BendersSolver:
                         iterations=it,
                         best_lower_bound=best_lb,
                         best_upper_bound=best_ub,
+                        pax_served=last_pax_served,
+                        pax_total=last_pax_total,
                     )
                 # Stall stopping: if gap does not improve sufficiently for several iterations
                 if stall_max > 0:
@@ -659,6 +728,8 @@ class BendersSolver:
                         iterations=it,
                         best_lower_bound=best_lb,
                         best_upper_bound=best_ub,
+                        pax_served=last_pax_served,
+                        pax_total=last_pax_total,
                     )
 
         log.warning("Max iterations reached: %d", max_it)
@@ -687,6 +758,8 @@ class BendersSolver:
             iterations=max_it,
             best_lower_bound=best_lb,
             best_upper_bound=best_ub,
+            pax_served=last_pax_served,
+            pax_total=last_pax_total,
         )
 
 
