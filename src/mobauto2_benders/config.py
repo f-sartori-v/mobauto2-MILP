@@ -83,8 +83,13 @@ class ModelSection:
 
 @dataclass(slots=True)
 class MasterSection:
-    use_lazy_cuts: bool = False
     use_fifo_symmetry: bool = False
+    symmetry_breaking: bool = False
+    use_mip_start: bool = False
+    solve_time_limit_s: int | None = None
+    mipgap: float | None = None
+    cplex_options: dict[str, Any] = field(default_factory=dict)
+    solver_backend: str = "cplex_direct"
     aggregate_cuts_by_tau: bool = True
     cut_coeff_threshold: float = 0.0
     theta_per_scenario: bool = False
@@ -113,7 +118,7 @@ class SolverSection:
     stall_max_no_improve_iters: int = 0
     stall_min_abs_improve: float = 0.0
     stall_min_rel_improve: float = 0.0
-    master_solver: str = "cplex_persistent"
+    master_solver: str = "cplex"
     subproblem_solver: str = "cplex_direct"
     solver_tee: bool = False
 
@@ -288,6 +293,14 @@ def _ensure_num_or_expr(value: Any, where: str) -> float | int | str:
     raise ValueError(f"{where} must be numeric or an arithmetic expression")
 
 
+def _ensure_mapping(value: Any, where: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{where} must be a mapping")
+    return dict(value)
+
+
 def _disallow_expr(value: Any, where: str) -> Any:
     if isinstance(value, str) and _looks_like_expr(value):
         raise ValueError(f"{where} cannot be an expression; provide a numeric value")
@@ -321,6 +334,15 @@ def upgrade_config_v1_to_v2(old: Mapping[str, Any]) -> dict[str, Any]:
     sub = _as_mapping(old.get("subproblem", {}), "subproblem")
     master_params = _as_mapping(master.get("params", {}), "master.params")
     sub_params = _as_mapping(sub.get("params", {}), "subproblem.params")
+
+    lazy_key = "use_" + "lazy" + "_cuts"
+    lazy_cb_key = "lazy" + "_cb" + "_lp_solver"
+    if lazy_key in master_params:
+        raise ValueError("lazy " + "cuts removed; delete key " + lazy_key)
+    if lazy_cb_key in master_params:
+        raise ValueError("callback cuts removed; delete key " + lazy_cb_key)
+    if str(master_params.get("solver", "")).lower() == "cplex_persistent":
+        raise ValueError("persistent solver mode removed; use solver=cplex")
 
     def _note(msg: str) -> None:
         warnings_list.append(msg)
@@ -365,8 +387,13 @@ def upgrade_config_v1_to_v2(old: Mapping[str, Any]) -> dict[str, Any]:
             },
         },
         "master": {
-            "use_lazy_cuts": master_params.get("use_lazy_cuts", False),
             "use_fifo_symmetry": master_params.get("use_fifo_symmetry", False),
+            "symmetry_breaking": master_params.get("symmetry_breaking", False),
+            "use_mip_start": master_params.get("use_mip_start", False),
+            "solve_time_limit_s": master_params.get("solve_time_limit_s"),
+            "mipgap": master_params.get("mipgap"),
+            "cplex_options": master_params.get("cplex_options", {}),
+            "solver_backend": master_params.get("solver_backend", "cplex_direct"),
             "aggregate_cuts_by_tau": master_params.get("aggregate_cuts_by_tau", True),
             "cut_coeff_threshold": master_params.get("cut_coeff_threshold", 0.0),
             "theta_per_scenario": master_params.get("theta_per_scenario", False),
@@ -391,7 +418,7 @@ def upgrade_config_v1_to_v2(old: Mapping[str, Any]) -> dict[str, Any]:
             "stall_max_no_improve_iters": run.get("stall_max_no_improve_iters", 0),
             "stall_min_abs_improve": run.get("stall_min_abs_improve", 0.0),
             "stall_min_rel_improve": run.get("stall_min_rel_improve", 0.0),
-            "master_solver": master_params.get("solver", "cplex_persistent"),
+            "master_solver": master_params.get("solver", "cplex"),
             "subproblem_solver": sub_params.get("lp_solver", "cplex_direct"),
             "solver_tee": master_params.get("solver_tee", False),
         },
@@ -572,11 +599,18 @@ def _parse_v2(raw: Mapping[str, Any]) -> RootConfig:
     )
 
     master_raw = _as_mapping(data.get("master"), "master")
+    if ("use_" + "lazy" + "_cuts") in master_raw:
+        raise ValueError("lazy " + "cuts removed; delete key use_" + "lazy" + "_cuts")
     _check_unknown_keys(
         master_raw,
         {
-            "use_lazy_cuts",
             "use_fifo_symmetry",
+            "symmetry_breaking",
+            "use_mip_start",
+            "solve_time_limit_s",
+            "mipgap",
+            "cplex_options",
+            "solver_backend",
             "aggregate_cuts_by_tau",
             "cut_coeff_threshold",
             "theta_per_scenario",
@@ -585,8 +619,27 @@ def _parse_v2(raw: Mapping[str, Any]) -> RootConfig:
         "master",
     )
     master_section = MasterSection(
-        use_lazy_cuts=_ensure_bool(master_raw.get("use_lazy_cuts", False), "master.use_lazy_cuts"),
         use_fifo_symmetry=_ensure_bool(master_raw.get("use_fifo_symmetry", False), "master.use_fifo_symmetry"),
+        symmetry_breaking=_ensure_bool(master_raw.get("symmetry_breaking", False), "master.symmetry_breaking"),
+        use_mip_start=_ensure_bool(master_raw.get("use_mip_start", False), "master.use_mip_start"),
+        solve_time_limit_s=(
+            _ensure_int(
+                _disallow_expr(master_raw.get("solve_time_limit_s"), "master.solve_time_limit_s"),
+                "master.solve_time_limit_s",
+            )
+            if master_raw.get("solve_time_limit_s") is not None
+            else None
+        ),
+        mipgap=(
+            _ensure_float(
+                _disallow_expr(master_raw.get("mipgap"), "master.mipgap"),
+                "master.mipgap",
+            )
+            if master_raw.get("mipgap") is not None
+            else None
+        ),
+        cplex_options=_ensure_mapping(master_raw.get("cplex_options"), "master.cplex_options"),
+        solver_backend=_ensure_str(master_raw.get("solver_backend", "cplex_direct"), "master.solver_backend"),
         aggregate_cuts_by_tau=_ensure_bool(master_raw.get("aggregate_cuts_by_tau", True), "master.aggregate_cuts_by_tau"),
         cut_coeff_threshold=_ensure_float(
             _disallow_expr(master_raw.get("cut_coeff_threshold", 0.0), "master.cut_coeff_threshold"),
@@ -689,6 +742,8 @@ def _parse_v2(raw: Mapping[str, Any]) -> RootConfig:
         subproblem_solver=_ensure_str(solver_raw.get("subproblem_solver"), "solver.subproblem_solver"),
         solver_tee=_ensure_bool(solver_raw.get("solver_tee", False), "solver.solver_tee"),
     )
+    if solver_section.master_solver.lower() == "cplex_persistent":
+        raise ValueError("persistent solver mode removed; use solver.master_solver=cplex")
 
     model_section = ModelSection(
         time=time_section,

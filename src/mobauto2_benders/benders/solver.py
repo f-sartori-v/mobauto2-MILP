@@ -104,6 +104,7 @@ def add_benders_cut(
         _dbg(
             f"[BENDERS] cut skipped: small violation (it={iteration} type={cut_type} lhs={float(lhs_value):.6g} rhs={float(rhs_value):.6g} viol={viol:.3g} thr={thr:.3g})"
         )
+        log.info("[BENDERS] skip reason=numerically_small signature=None cuts_in_model=?")
         return False
 
     # Prepare slopes as a dictionary for debug printing and signature computation
@@ -146,10 +147,14 @@ def add_benders_cut(
             if nnz > kmax > 0:
                 log.info("... (%d coefficient(s) omitted)", nnz - kmax)
 
+    if not _slopes_dict:
+        log.info("[BENDERS] skip reason=invalid_slopes signature=None cuts_in_model=?")
+        return False
     sig = make_cut_signature(const, _slopes_dict, scope=signature_scope)
     if sig in _cut_signatures:
         nnz = len(sig[-1]) if isinstance(sig, tuple) and len(sig) > 0 else "-"
         _dbg(f"[BENDERS] cut skipped: duplicate (it={iteration} type={cut_type} nnz={nnz})")
+        log.info("[BENDERS] skip reason=duplicate_by_signature signature=%s", str(sig))
         return False
 
     _cut_signatures.add(sig)
@@ -166,6 +171,13 @@ class BendersRunResult:
     best_upper_bound: Optional[float]
     pax_served: Optional[float] = None
     pax_total: Optional[float] = None
+    subproblem_obj: Optional[float] = None
+    sp_wait_cost_slots: Optional[float] = None
+    sp_fill_eps_cost: Optional[float] = None
+    sp_penalty_cost: Optional[float] = None
+    sp_penalty_pax: Optional[float] = None
+    sp_total_demand: Optional[float] = None
+    sp_slot_resolution: Optional[int] = None
 
 
 class BendersSolver:
@@ -176,10 +188,17 @@ class BendersSolver:
 
     def run(self) -> BendersRunResult:
         t0 = time.time()
+        _cut_signatures.clear()
         max_it = self.cfg.solver.max_iterations
         tol = self.cfg.solver.tolerance
         self.master.initialize()
         print("Initialized master problem.")
+
+        total_master_time = 0.0
+        total_sp_solve_time = 0.0
+        total_cutgen_time = 0.0
+        total_cutadd_time = 0.0
+        total_iter = 0
 
         last_pax_served: Optional[float] = None
         last_pax_total: Optional[float] = None
@@ -385,24 +404,6 @@ class BendersSolver:
                 pass
             last_pax_served, last_pax_total = _calc_pax_totals_from_diag(diag)
 
-        # Optionally install lazy constraints callback if supported
-        use_lazy = bool(self.cfg.master.use_lazy_cuts)
-        # Magnanti–Wong requires explicit separation to access the core point; disable lazy when enabled
-        try:
-            if bool(self.cfg.subproblem.use_magnanti_wong):
-                use_lazy = False
-        except Exception:
-            pass
-        if use_lazy and hasattr(self.master, "install_lazy_callback"):
-            # Pass the subproblem instance so the callback can generate cuts
-            getattr(self.master, "install_lazy_callback")(self.subproblem)
-            # If install failed (no callback), fallback to non-lazy
-            try:
-                if not getattr(self.master, "lazy_installed", lambda: False)():
-                    use_lazy = False
-            except Exception:
-                use_lazy = False
-
         best_lb: Optional[float] = None
         best_ub: Optional[float] = None
         # Stall detection on gap improvement
@@ -413,6 +414,37 @@ class BendersSolver:
         prev_gap: Optional[float] = None
 
         last_diag: dict | None = None
+
+        def _extract_sp_diag(diag: dict | None) -> dict[str, Any]:
+            if not isinstance(diag, dict):
+                return {}
+            return {
+                "subproblem_obj": diag.get("objective_value"),
+                "sp_wait_cost_slots": diag.get("waiting_cost_slots"),
+                "sp_fill_eps_cost": diag.get("fill_eps_cost"),
+                "sp_penalty_cost": diag.get("penalty_cost"),
+                "sp_penalty_pax": diag.get("penalty_pax"),
+                "sp_total_demand": diag.get("total_demand"),
+                "sp_slot_resolution": diag.get("slot_resolution"),
+            }
+
+        def _make_result(status: SolveStatus, iterations: int) -> BendersRunResult:
+            extra = _extract_sp_diag(last_diag)
+            return BendersRunResult(
+                status=status,
+                iterations=iterations,
+                best_lower_bound=best_lb,
+                best_upper_bound=best_ub,
+                pax_served=last_pax_served,
+                pax_total=last_pax_total,
+                subproblem_obj=extra.get("subproblem_obj"),
+                sp_wait_cost_slots=extra.get("sp_wait_cost_slots"),
+                sp_fill_eps_cost=extra.get("sp_fill_eps_cost"),
+                sp_penalty_cost=extra.get("sp_penalty_cost"),
+                sp_penalty_pax=extra.get("sp_penalty_pax"),
+                sp_total_demand=extra.get("sp_total_demand"),
+                sp_slot_resolution=extra.get("sp_slot_resolution"),
+            )
         for it in range(1, max_it + 1):
             if time.time() - t0 > self.cfg.solver.time_limit_s:
                 log.warning("Time limit reached after %d iterations", it - 1)
@@ -442,18 +474,44 @@ class BendersSolver:
                         pass
                 except Exception:
                     pass
-                return BendersRunResult(
-                    status=SolveStatus.UNKNOWN,
-                    iterations=it - 1,
-                    best_lower_bound=best_lb,
-                    best_upper_bound=best_ub,
-                    pax_served=last_pax_served,
-                    pax_total=last_pax_total,
-                )
+                # Summary timing
+                try:
+                    total_time = total_master_time + total_sp_time + total_cutgen_time + total_cutadd_time
+                    if total_time > 0 and total_iter > 0:
+                        print("\n=== Timing Summary ===")
+                        print(
+                            "Total: master=%.3fs (%.1f%%) sp_solve=%.3fs (%.1f%%) cutgen=%.3fs (%.1f%%) cutadd=%.3fs (%.1f%%)"
+                            % (
+                                total_master_time,
+                                100.0 * total_master_time / total_time,
+                                total_sp_solve_time,
+                                100.0 * total_sp_solve_time / total_time,
+                                total_cutgen_time,
+                                100.0 * total_cutgen_time / total_time,
+                                total_cutadd_time,
+                                100.0 * total_cutadd_time / total_time,
+                            )
+                        )
+                        print(
+                            "Avg/iter: master=%.3fs sp_solve=%.3fs cutgen=%.3fs cutadd=%.3fs"
+                            % (
+                                total_master_time / total_iter,
+                                total_sp_solve_time / total_iter,
+                                total_cutgen_time / total_iter,
+                                total_cutadd_time / total_iter,
+                            )
+                        )
+                except Exception:
+                    pass
+                return _make_result(SolveStatus.UNKNOWN, it - 1)
 
             print(f"\n=== Iteration {it} ===")
             print("Solving Master (MP)...")
+            mp_t0 = time.perf_counter()
             mres = self.master.solve()
+            mp_t1 = time.perf_counter()
+            mp_time = mp_t1 - mp_t0
+            total_master_time += mp_time
             log.info(
                 "iter=%d master status=%s obj=%s lb=%s",
                 it,
@@ -490,14 +548,7 @@ class BendersSolver:
 
             if mres.status == SolveStatus.INFEASIBLE:
                 log.error("Master problem infeasible")
-                return BendersRunResult(
-                    status=mres.status,
-                    iterations=it,
-                    best_lower_bound=best_lb,
-                    best_upper_bound=best_ub,
-                    pax_served=last_pax_served,
-                    pax_total=last_pax_total,
-                )
+                return _make_result(mres.status, it)
 
             # Update lower bound if provided
             if mres.lower_bound is not None:
@@ -505,14 +556,8 @@ class BendersSolver:
 
             if not mres.candidate:
                 log.error("Master did not return a candidate solution")
-                return BendersRunResult(
-                    status=SolveStatus.UNKNOWN,
-                    iterations=it,
-                    best_lower_bound=best_lb,
-                    best_upper_bound=best_ub,
-                    pax_served=last_pax_served,
-                    pax_total=last_pax_total,
-                )
+                print("Master did not return a usable incumbent; stopping.")
+                return _make_result(SolveStatus.UNKNOWN, it)
 
             # Optional: update and pass a core point for Magnanti–Wong selection
             try:
@@ -545,7 +590,10 @@ class BendersSolver:
                     pass
 
             print("Evaluating Subproblem (SP) at candidate...")
+            sp_t0 = time.perf_counter()
             sres: SubproblemResult = self.subproblem.evaluate(mres.candidate)
+            sp_t1 = time.perf_counter()
+            sp_time = sp_t1 - sp_t0
             # Update UB if provided (include first-stage cost from master to compare totals)
             if sres.upper_bound is not None:
                 try:
@@ -589,63 +637,112 @@ class BendersSolver:
             except Exception:
                 pass
             # Suppress repetitive demand printouts; diagnostics still available at the end
-            # Add cut(s) if provided (optimality or feasibility) unless using lazy cuts
+            # Add cut(s) if provided (optimality or feasibility)
+            cut_t0 = time.perf_counter()
             added = 0
             cut_names: list[str] = []
-            if not use_lazy:
-                # Capture current number of cuts before adding
-                try:
-                    cuts_before = getattr(self.master, "cuts_count", lambda: 0)()
-                except Exception:
-                    cuts_before = 0
+            # Capture current number of cuts before adding
+            try:
+                cuts_before = getattr(self.master, "cuts_count", lambda: 0)()
+            except Exception:
+                cuts_before = 0
 
-                # Force-accept the first violated cut at this incumbent
-                forced_added = False
-                if sres.cut is not None and hasattr(self.master, "add_cut_force"):
+            # Force-accept the first violated cut at this incumbent
+            forced_added = False
+            if sres.cut is not None and hasattr(self.master, "add_cut_force"):
+                try:
+                    forced_added = bool(getattr(self.master, "add_cut_force")(sres.cut))
+                except Exception:
+                    forced_added = False
+                if forced_added:
+                    cut_names.append(sres.cut.name)
+                    log.info("force-added %s cut '%s'", sres.cut.cut_type, sres.cut.name)
+
+            # If nothing forced yet, try forcing the first in sres.cuts
+            if (not forced_added) and getattr(sres, "cuts", None) and hasattr(self.master, "add_cut_force"):
+                for c in sres.cuts or []:
                     try:
-                        forced_added = bool(getattr(self.master, "add_cut_force")(sres.cut))
+                        forced_added = bool(getattr(self.master, "add_cut_force")(c))
                     except Exception:
                         forced_added = False
                     if forced_added:
-                        cut_names.append(sres.cut.name)
-                        log.info("force-added %s cut '%s'", sres.cut.cut_type, sres.cut.name)
+                        cut_names.append(c.name)
+                        log.info("force-added %s cut '%s'", c.cut_type, c.name)
+                        break
 
-                # If nothing forced yet, try forcing the first in sres.cuts
-                if (not forced_added) and getattr(sres, "cuts", None) and hasattr(self.master, "add_cut_force"):
-                    for c in sres.cuts or []:
-                        try:
-                            forced_added = bool(getattr(self.master, "add_cut_force")(c))
-                        except Exception:
-                            forced_added = False
-                        if forced_added:
-                            cut_names.append(c.name)
-                            log.info("force-added %s cut '%s'", c.cut_type, c.name)
-                            break
+            # Add remaining cuts through the normal filtered path
+            if sres.cut is not None and not forced_added:
+                self.master.add_cut(sres.cut)
+                cut_names.append(sres.cut.name)
+            for c in getattr(sres, "cuts", []) or []:
+                # Avoid re-adding the same cut if it was force-added above
+                if forced_added and cut_names and c.name == cut_names[-1]:
+                    continue
+                self.master.add_cut(c)
+                cut_names.append(c.name)
 
-                # Add remaining cuts through the normal filtered path
-                if sres.cut is not None and not forced_added:
-                    self.master.add_cut(sres.cut)
-                    cut_names.append(sres.cut.name)
-                for c in getattr(sres, "cuts", []) or []:
-                    # Avoid re-adding the same cut if it was force-added above
-                    if forced_added and cut_names and c.name == cut_names[-1]:
-                        continue
-                    self.master.add_cut(c)
-                    cut_names.append(c.name)
+            # Compute how many were actually added
+            try:
+                cuts_after = getattr(self.master, "cuts_count", lambda: 0)()
+            except Exception:
+                cuts_after = cuts_before
+            added = int(cuts_after) - int(cuts_before)
+            if added > 0:
+                log.info("added %d cut(s)", added)
+                names_str = ", ".join(cut_names) if cut_names else "(unnamed)"
+                print(f"Master updated: added {added} cut(s): {names_str}")
+            else:
+                if cut_names:
+                    print("Master updated: no new cuts (all skipped / duplicates)")
+            cut_t1 = time.perf_counter()
+            cut_add_time = cut_t1 - cut_t0
+            total_cutadd_time += cut_add_time
 
-                # Compute how many were actually added
-                try:
-                    cuts_after = getattr(self.master, "cuts_count", lambda: 0)()
-                except Exception:
-                    cuts_after = cuts_before
-                added = int(cuts_after) - int(cuts_before)
-                if added > 0:
-                    log.info("added %d cut(s)", added)
-                    names_str = ", ".join(cut_names) if cut_names else "(unnamed)"
-                    print(f"Master updated: added {added} cut(s): {names_str}")
-                else:
-                    if cut_names:
-                        print("Master updated: no new cuts (all skipped / duplicates)")
+            sp_solve_time = None
+            cutgen_time = None
+            if isinstance(last_diag, dict):
+                sp_solve_time = last_diag.get("timing_sp_solve_s")
+                cutgen_time = last_diag.get("timing_cutgen_s")
+            if sp_solve_time is None:
+                sp_solve_time = sp_time
+            if cutgen_time is None:
+                cutgen_time = 0.0
+            total_sp_solve_time += float(sp_solve_time)
+            total_cutgen_time += float(cutgen_time)
+
+            total_iter += 1
+
+            # Per-iteration timing + stats
+            stats = {}
+            try:
+                stats = getattr(self.master, "last_solve_stats", lambda: {})()
+            except Exception:
+                stats = {}
+            nodes = stats.get("nodes")
+            gap = stats.get("gap")
+            best_bound = stats.get("best_bound")
+            incumbent = stats.get("incumbent")
+            print(
+                "Timing: master=%.3fs sp_solve=%.3fs cutgen=%.3fs cutadd=%.3fs cuts_added=%s total_cuts=%s"
+                % (
+                    mp_time,
+                    float(sp_solve_time),
+                    float(cutgen_time),
+                    cut_add_time,
+                    added,
+                    getattr(self.master, "cuts_count", lambda: "-")(),
+                )
+            )
+            if nodes is not None or best_bound is not None or incumbent is not None or gap is not None:
+                print(
+                    "MP stats: nodes=%s best_bound=%s incumbent=%s gap=%s"
+                    % (
+                        str(nodes),
+                        str(best_bound),
+                        str(incumbent),
+                        str(gap),
+                    )
+                )
 
             # Check gap if we have both bounds
             if best_lb is not None and best_ub is not None:
@@ -671,14 +768,47 @@ class BendersSolver:
                         _print_sp_diagnostics(last_diag)
                     except Exception:
                         pass
-                    return BendersRunResult(
-                        status=SolveStatus.OPTIMAL,
-                        iterations=it,
-                        best_lower_bound=best_lb,
-                        best_upper_bound=best_ub,
-                        pax_served=last_pax_served,
-                        pax_total=last_pax_total,
-                    )
+                    # Summary timing
+                    try:
+                        total_time = total_master_time + total_sp_solve_time + total_cutgen_time + total_cutadd_time
+                        if total_time > 0 and total_iter > 0:
+                            print("\n=== Timing Summary ===")
+                            print(
+                                "Total: master=%.3fs (%.1f%%) sp_solve=%.3fs (%.1f%%) cutgen=%.3fs (%.1f%%) cutadd=%.3fs (%.1f%%)"
+                                % (
+                                    total_master_time,
+                                    100.0 * total_master_time / total_time,
+                                    total_sp_solve_time,
+                                    100.0 * total_sp_solve_time / total_time,
+                                    total_cutgen_time,
+                                    100.0 * total_cutgen_time / total_time,
+                                    total_cutadd_time,
+                                    100.0 * total_cutadd_time / total_time,
+                                )
+                            )
+                            print(
+                                "Avg/iter: master=%.3fs sp_solve=%.3fs cutgen=%.3fs cutadd=%.3fs"
+                                % (
+                                    total_master_time / total_iter,
+                                    total_sp_solve_time / total_iter,
+                                    total_cutgen_time / total_iter,
+                                    total_cutadd_time / total_iter,
+                                )
+                            )
+                    except Exception:
+                        pass
+                        print(
+                            "Avg/iter: master=%.3fs sp_solve=%.3fs cutgen=%.3fs cutadd=%.3fs"
+                            % (
+                                total_master_time / total_iter,
+                                total_sp_solve_time / total_iter,
+                                total_cutgen_time / total_iter,
+                                total_cutadd_time / total_iter,
+                            )
+                        )
+                    except Exception:
+                        pass
+                    return _make_result(SolveStatus.OPTIMAL, it)
                 # Stall stopping: if gap does not improve sufficiently for several iterations
                 if stall_max > 0:
                     improved = False
@@ -723,14 +853,36 @@ class BendersSolver:
                             pass
                     except Exception:
                         pass
-                    return BendersRunResult(
-                        status=SolveStatus.FEASIBLE,
-                        iterations=it,
-                        best_lower_bound=best_lb,
-                        best_upper_bound=best_ub,
-                        pax_served=last_pax_served,
-                        pax_total=last_pax_total,
-                    )
+                    # Summary timing
+                    try:
+                        total_time = total_master_time + total_sp_time + total_cutgen_time + total_cutadd_time
+                        if total_time > 0 and total_iter > 0:
+                            print("\n=== Timing Summary ===")
+                            print(
+                            "Total: master=%.3fs (%.1f%%) sp_solve=%.3fs (%.1f%%) cutgen=%.3fs (%.1f%%) cutadd=%.3fs (%.1f%%)"
+                            % (
+                                total_master_time,
+                                100.0 * total_master_time / total_time,
+                                total_sp_solve_time,
+                                100.0 * total_sp_solve_time / total_time,
+                                total_cutgen_time,
+                                100.0 * total_cutgen_time / total_time,
+                                total_cutadd_time,
+                                100.0 * total_cutadd_time / total_time,
+                            )
+                        )
+                        print(
+                            "Avg/iter: master=%.3fs sp_solve=%.3fs cutgen=%.3fs cutadd=%.3fs"
+                            % (
+                                total_master_time / total_iter,
+                                total_sp_solve_time / total_iter,
+                                total_cutgen_time / total_iter,
+                                total_cutadd_time / total_iter,
+                            )
+                        )
+                    except Exception:
+                        pass
+                    return _make_result(SolveStatus.FEASIBLE, it)
 
         log.warning("Max iterations reached: %d", max_it)
         # Print incumbent solution if available at max-iterations stop
@@ -753,14 +905,36 @@ class BendersSolver:
                 pass
         except Exception:
             pass
-        return BendersRunResult(
-            status=SolveStatus.UNKNOWN,
-            iterations=max_it,
-            best_lower_bound=best_lb,
-            best_upper_bound=best_ub,
-            pax_served=last_pax_served,
-            pax_total=last_pax_total,
-        )
+        # Summary timing
+        try:
+            total_time = total_master_time + total_sp_time + total_cutgen_time + total_cutadd_time
+            if total_time > 0 and total_iter > 0:
+                print("\n=== Timing Summary ===")
+                print(
+                    "Total: master=%.3fs (%.1f%%) sp_solve=%.3fs (%.1f%%) cutgen=%.3fs (%.1f%%) cutadd=%.3fs (%.1f%%)"
+                    % (
+                        total_master_time,
+                        100.0 * total_master_time / total_time,
+                        total_sp_solve_time,
+                        100.0 * total_sp_solve_time / total_time,
+                        total_cutgen_time,
+                        100.0 * total_cutgen_time / total_time,
+                        total_cutadd_time,
+                        100.0 * total_cutadd_time / total_time,
+                    )
+                )
+                print(
+                    "Avg/iter: master=%.3fs sp_solve=%.3fs cutgen=%.3fs cutadd=%.3fs"
+                    % (
+                        total_master_time / total_iter,
+                        total_sp_solve_time / total_iter,
+                        total_cutgen_time / total_iter,
+                        total_cutadd_time / total_iter,
+                    )
+                )
+        except Exception:
+            pass
+        return _make_result(SolveStatus.UNKNOWN, max_it)
 
 
 __all__ = ["BendersSolver", "BendersRunResult"]

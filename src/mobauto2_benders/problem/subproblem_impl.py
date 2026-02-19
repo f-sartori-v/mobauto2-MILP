@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Tuple, Iterable
+import time
 from pathlib import Path
 import json
 try:
@@ -415,6 +416,15 @@ class ProblemSubproblem(Subproblem):
             coeffs_out_list: list[Dict[tuple[int, int], float]] = []
             coeffs_ret_list: list[Dict[tuple[int, int], float]] = []
             scenario_diags: list[dict] = []
+            agg = {
+                "objective_value": [],
+                "waiting_cost_slots": [],
+                "fill_eps_cost": [],
+                "penalty_cost": [],
+                "penalty_pax": [],
+                "served_total": [],
+                "total_demand": [],
+            }
 
             for idx_s, s in enumerate(scenarios):
                 if isinstance(s, (str, Path)):
@@ -436,10 +446,14 @@ class ProblemSubproblem(Subproblem):
                 K_out_lp = [max(1, int(K_out[t])) for t in range(T)] if use_dual else K_out
                 K_ret_lp = [max(1, int(K_ret[t])) for t in range(T)] if use_dual else K_ret
                 sp_params = SPParams(T=T, Wmax_slots=Wmax, p=p_pen, lp_solver=lp_solver, S=S, K_out=K_out_lp, K_ret=K_ret_lp, fill_eps=fill_eps, solver_options=solver_options)
+                t_solve0 = time.perf_counter()
                 duals, ub_val = solve_subproblem(sp_params, C_out, C_ret, R_out, R_ret)
+                t_solve1 = time.perf_counter()
+                sp_solve_time = t_solve1 - t_solve0
                 ub_vals.append(ub_val)
 
                 # Build marginal slopes either from duals (fast) or finite differences (fallback)
+                t_cut0 = time.perf_counter()
                 if mw_enabled:
                     # MW-selected dual slopes on optimal face
                     # Ensure at least one capacity layer per tau for dual π variables
@@ -506,6 +520,9 @@ class ProblemSubproblem(Subproblem):
                 else:
                     # Finite-difference coefficients and constant per scenario
                     c_out_map, c_ret_map, dm_out, dm_ret = coeffs_by_fdiff(ub_val, C_out, C_ret, K_out, K_ret, R_out, R_ret)
+                t_cut1 = time.perf_counter()
+                cutgen_time = t_cut1 - t_cut0
+
                 sum_y_out = [float(C_out[tau]) / S if S != 0 else 0.0 for tau in range(T)]
                 sum_y_ret = [float(C_ret[tau]) / S if S != 0 else 0.0 for tau in range(T)]
                 const = float(ub_val)
@@ -554,15 +571,68 @@ class ProblemSubproblem(Subproblem):
                     "pax_ret_by_tau": list(duals.get("served_ret_by_tau", [0.0] * T)),
                     "pax_out_by_tau_k": list(duals.get("served_out_by_tau_k", [[] for _ in range(T)])),
                     "pax_ret_by_tau_k": list(duals.get("served_ret_by_tau_k", [[] for _ in range(T)])),
+                    "objective_value": float(duals.get("objective_value", ub_val)),
+                    "waiting_cost_slots": float(duals.get("waiting_cost_slots", 0.0)),
+                    "fill_eps_cost": float(duals.get("fill_eps_cost", 0.0)),
+                    "penalty_cost": float(duals.get("penalty_cost", 0.0)),
+                    "penalty_pax": float(duals.get("penalty_pax", 0.0)),
+                    "served_total": float(duals.get("served_total", 0.0)),
+                    "total_demand": float(duals.get("total_demand", 0.0)),
+                    "timing_sp_solve_s": sp_solve_time,
+                    "timing_cutgen_s": cutgen_time,
                 })
+                agg["objective_value"].append(float(duals.get("objective_value", ub_val)))
+                agg["waiting_cost_slots"].append(float(duals.get("waiting_cost_slots", 0.0)))
+                agg["fill_eps_cost"].append(float(duals.get("fill_eps_cost", 0.0)))
+                agg["penalty_cost"].append(float(duals.get("penalty_cost", 0.0)))
+                agg["penalty_pax"].append(float(duals.get("penalty_pax", 0.0)))
+                agg["served_total"].append(float(duals.get("served_total", 0.0)))
+                agg["total_demand"].append(float(duals.get("total_demand", 0.0)))
+                agg.setdefault("timing_sp_solve_s", []).append(sp_solve_time)
+                agg.setdefault("timing_cutgen_s", []).append(cutgen_time)
+                agg["objective_value"].append(float(duals.get("objective_value", ub_val)))
+                agg["waiting_cost_slots"].append(float(duals.get("waiting_cost_slots", 0.0)))
+                agg["fill_eps_cost"].append(float(duals.get("fill_eps_cost", 0.0)))
+                agg["penalty_cost"].append(float(duals.get("penalty_cost", 0.0)))
+                agg["penalty_pax"].append(float(duals.get("penalty_pax", 0.0)))
+                agg["served_total"].append(float(duals.get("served_total", 0.0)))
+                agg["total_demand"].append(float(duals.get("total_demand", 0.0)))
 
             # Aggregate UB
             if ub_aggregation == "mean":
                 ub_val_agg = sum(w * u for w, u in zip(weights, ub_vals))
+                agg_obj = sum(w * u for w, u in zip(weights, agg["objective_value"]))
+                agg_wait = sum(w * u for w, u in zip(weights, agg["waiting_cost_slots"]))
+                agg_fill = sum(w * u for w, u in zip(weights, agg["fill_eps_cost"]))
+                agg_pen = sum(w * u for w, u in zip(weights, agg["penalty_cost"]))
+                agg_pen_pax = sum(w * u for w, u in zip(weights, agg["penalty_pax"]))
+                agg_served = sum(w * u for w, u in zip(weights, agg["served_total"]))
+                agg_total = sum(w * u for w, u in zip(weights, agg["total_demand"]))
+                agg_sp_time = sum(w * u for w, u in zip(weights, agg["timing_sp_solve_s"]))
+                agg_cut_time = sum(w * u for w, u in zip(weights, agg["timing_cutgen_s"]))
             elif ub_aggregation == "sum":
                 ub_val_agg = sum(ub_vals)
+                agg_obj = sum(agg["objective_value"])
+                agg_wait = sum(agg["waiting_cost_slots"])
+                agg_fill = sum(agg["fill_eps_cost"])
+                agg_pen = sum(agg["penalty_cost"])
+                agg_pen_pax = sum(agg["penalty_pax"])
+                agg_served = sum(agg["served_total"])
+                agg_total = sum(agg["total_demand"])
+                agg_sp_time = sum(agg["timing_sp_solve_s"])
+                agg_cut_time = sum(agg["timing_cutgen_s"])
             elif ub_aggregation == "max":
                 ub_val_agg = max(ub_vals)
+                idx_max = int(ub_vals.index(ub_val_agg))
+                agg_obj = agg["objective_value"][idx_max]
+                agg_wait = agg["waiting_cost_slots"][idx_max]
+                agg_fill = agg["fill_eps_cost"][idx_max]
+                agg_pen = agg["penalty_cost"][idx_max]
+                agg_pen_pax = agg["penalty_pax"][idx_max]
+                agg_served = agg["served_total"][idx_max]
+                agg_total = agg["total_demand"][idx_max]
+                agg_sp_time = agg["timing_sp_solve_s"][idx_max]
+                agg_cut_time = agg["timing_cutgen_s"][idx_max]
             else:
                 raise ValueError("ub_aggregation must be one of 'mean', 'sum', 'max'")
 
@@ -600,6 +670,16 @@ class ProblemSubproblem(Subproblem):
                         "T": T,
                         "scenarios": scenario_diags,
                         "scenario_weights": list(weights) if weights is not None else None,
+                        "objective_value": agg_obj,
+                        "waiting_cost_slots": agg_wait,
+                        "fill_eps_cost": agg_fill,
+                        "penalty_cost": agg_pen,
+                        "penalty_pax": agg_pen_pax,
+                        "served_total": agg_served,
+                        "total_demand": agg_total,
+                        "slot_resolution": int(params.get("slot_resolution", 1)),
+                        "timing_sp_solve_s": agg_sp_time,
+                        "timing_cutgen_s": agg_cut_time,
                     },
                 )
         else:
@@ -621,9 +701,13 @@ class ProblemSubproblem(Subproblem):
             K_out_lp = [max(1, int(K_out[t])) for t in range(T)] if use_dual else K_out
             K_ret_lp = [max(1, int(K_ret[t])) for t in range(T)] if use_dual else K_ret
             sp_params = SPParams(T=T, Wmax_slots=Wmax, p=p_pen, lp_solver=lp_solver, S=S, K_out=K_out_lp, K_ret=K_ret_lp, fill_eps=fill_eps, solver_options=solver_options)
+            t_solve0 = time.perf_counter()
             duals, ub_val = solve_subproblem(sp_params, C_out, C_ret, R_out, R_ret)
+            t_solve1 = time.perf_counter()
+            sp_solve_time = t_solve1 - t_solve0
 
             # Build coefficients via MW, duals (fast) or finite differences (fallback)
+            t_cut0 = time.perf_counter()
             if mw_enabled:
                 dm_pair = solve_mw_dual(
                     T, Wmax, p_pen, S,
@@ -689,6 +773,9 @@ class ProblemSubproblem(Subproblem):
                 # Finite differences fallback
                 c_out_map, c_ret_map, dm_out, dm_ret = coeffs_by_fdiff(ub_val, C_out, C_ret, K_out, K_ret, R_out, R_ret)
 
+            t_cut1 = time.perf_counter()
+            cutgen_time = t_cut1 - t_cut0
+
             # Number of vehicles per departure time from current candidate
             sum_y_out = [float(C_out[tau]) / S if S != 0 else 0.0 for tau in range(T)]
             sum_y_ret = [float(C_ret[tau]) / S if S != 0 else 0.0 for tau in range(T)]
@@ -738,6 +825,16 @@ class ProblemSubproblem(Subproblem):
                 "pax_ret_by_tau": list(duals.get("served_ret_by_tau", [0.0] * T)),
                 "pax_out_by_tau_k": list(duals.get("served_out_by_tau_k", [[] for _ in range(T)])),
                 "pax_ret_by_tau_k": list(duals.get("served_ret_by_tau_k", [[] for _ in range(T)])),
+                "objective_value": float(duals.get("objective_value", ub_val)),
+                "waiting_cost_slots": float(duals.get("waiting_cost_slots", 0.0)),
+                "fill_eps_cost": float(duals.get("fill_eps_cost", 0.0)),
+                "penalty_cost": float(duals.get("penalty_cost", 0.0)),
+                "penalty_pax": float(duals.get("penalty_pax", 0.0)),
+                "served_total": float(duals.get("served_total", 0.0)),
+                "total_demand": float(duals.get("total_demand", 0.0)),
+                "slot_resolution": int(params.get("slot_resolution", 1)),
+                "timing_sp_solve_s": sp_solve_time,
+                "timing_cutgen_s": cutgen_time,
             }
             return SubproblemResult(is_feasible=True, cut=cut, upper_bound=ub_val, diagnostics=diagnostics)
 
@@ -914,7 +1011,61 @@ def solve_subproblem(P: SPParams, C_out: Iterable[float], C_ret: Iterable[float]
     except Exception:
         ret_cost_val = 0.0
 
+    # Component costs
+    wait_cost_slots = 0.0
+    fill_eps_cost = 0.0
+    neg_contribs: list[tuple[float, int, int, int, float]] = []
+    for (t, tau, k) in m.ArcsOut:
+        val = float(pyo.value(m.x_OUT[t, tau, k]) or 0.0)
+        if val == 0.0:
+            continue
+        w = float(max(0, tau - t))
+        wait_cost_slots += w * val
+        fill_eps_cost += float(max(0.0, float(P.fill_eps))) * float(k) * val
+        contrib = w * val
+        if contrib < -1e-9:
+            neg_contribs.append((contrib, int(t), int(tau), int(k), val))
+    for (t, tau, k) in m.ArcsRet:
+        val = float(pyo.value(m.x_RET[t, tau, k]) or 0.0)
+        if val == 0.0:
+            continue
+        w = float(max(0, tau - t))
+        wait_cost_slots += w * val
+        fill_eps_cost += float(max(0.0, float(P.fill_eps))) * float(k) * val
+        contrib = w * val
+        if contrib < -1e-9:
+            neg_contribs.append((contrib, int(t), int(tau), int(k), val))
+
+    penalty_pax = float(sum(float(pyo.value(m.u_OUT[t])) for t in Tset) + sum(float(pyo.value(m.u_RET[t])) for t in Tset))
+    penalty_cost = float(P.p) * penalty_pax
+
     obj_val = float(pyo.value(m.obj))
+    sum_components = wait_cost_slots + fill_eps_cost + penalty_cost
+    if abs(sum_components - obj_val) > 1e-5:
+        print(
+            "[SP DIAG] Objective mismatch: obj=%.6g wait=%.6g fill_eps=%.6g penalty=%.6g sum=%.6g"
+            % (obj_val, wait_cost_slots, fill_eps_cost, penalty_cost, sum_components)
+        )
+        assert abs(sum_components - obj_val) <= 1e-5
+    if wait_cost_slots < -1e-9:
+        neg_contribs.sort(key=lambda x: x[0])
+        print("[SP DIAG] Negative waiting cost detected. Top negative contributions:")
+        for c, t, tau, k, val in neg_contribs[:10]:
+            print(f"  contrib={c:.6g} t={t} tau={tau} k={k} x={val:.6g}")
+        assert wait_cost_slots >= -1e-9
+    if penalty_cost < -1e-9:
+        print(f"[SP DIAG] Negative penalty cost detected: {penalty_cost:.6g}")
+        assert penalty_cost >= -1e-9
+    total_demand = float(sum(R_out) + sum(R_ret))
+    served_total = float(sum(served_out_by_tau) + sum(served_ret_by_tau))
+    # Consistency check: served + unmet == total demand (within tolerance)
+    if abs((served_total + penalty_pax) - total_demand) > 1e-5:
+        print(
+            "[SP DIAG] Demand mismatch: total=%.6g served=%.6g unmet=%.6g"
+            % (total_demand, served_total, penalty_pax)
+        )
+        # Do not assert here; keep diagnostic only
+
     return (
         {
             "alpha_OUT": alpha_OUT,
@@ -930,6 +1081,13 @@ def solve_subproblem(P: SPParams, C_out: Iterable[float], C_ret: Iterable[float]
             # components
             "ub_out": float(out_cost_val),
             "ub_ret": float(ret_cost_val),
+            "objective_value": obj_val,
+            "waiting_cost_slots": wait_cost_slots,
+            "fill_eps_cost": fill_eps_cost,
+            "penalty_cost": penalty_cost,
+            "penalty_pax": penalty_pax,
+            "served_total": served_total,
+            "total_demand": total_demand,
         },
         obj_val,
     )

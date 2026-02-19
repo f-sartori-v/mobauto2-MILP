@@ -36,7 +36,7 @@ model:
     # Number of shuttles
     Q: 3
     # Initial battery per shuttle (length Q)
-    binit: [150.0, 150.0, 150.0]
+    binit: [150.0, 150.0, 150.0, 150.0, 150.0, 150.0, 150.0]
   energy:
     # Battery capacity
     Emax: 150
@@ -51,10 +51,22 @@ model:
     concurrency_penalty: 0.25
 
 master:
-  # Enable lazy cuts via solver callback (if supported)
-  use_lazy_cuts: false
   # Optional FIFO symmetry-breaking across vehicles
   use_fifo_symmetry: true
+  # Symmetry breaking: order vehicles by total departures
+  symmetry_breaking: true
+  # Use previous master solution as a MIP start
+  use_mip_start: true
+  # Per-iteration master solve limit (seconds)
+  solve_time_limit_s: 10
+  # Per-iteration master MIP optimality gap
+  mipgap: 0.01
+  # Optional CPLEX parameters
+  cplex_options:
+    CPXPARAM_MIP_Strategy_Symmetry: 5
+    CPXPARAM_Threads: 0
+  # Master solver backend (preferred: cplex_direct)
+  solver_backend: cplex_direct
   # Stronger aggregated cuts by tau
   aggregate_cuts_by_tau: true
   # Use one theta per scenario (requires multi-cuts)
@@ -66,7 +78,7 @@ master:
 
 subproblem:
   # Multi-cuts vs averaged cut across scenarios
-  multi_cuts_by_scenario: true
+  multi_cuts_by_scenario: false
   # Magnanti–Wong selection for Pareto-optimal cuts
   use_magnanti_wong: true
   # Core-point mixing factor alpha in (0,1]
@@ -94,7 +106,7 @@ solver:
   stall_min_abs_improve: 1.0
   stall_min_rel_improve: 0.002
   # Backend solver names (Pyomo)
-  master_solver: cplex_persistent
+  master_solver: cplex
   subproblem_solver: cplex_direct
   # Emit solver logs during MP solves
   solver_tee: false

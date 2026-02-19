@@ -90,10 +90,10 @@ model:
     concurrency_penalty: 0.25
 
 master:
-  # Enable lazy cuts via solver callback (if supported)
-  use_lazy_cuts: true
   # Optional FIFO symmetry-breaking across vehicles
   use_fifo_symmetry: true
+  # Symmetry breaking: order vehicles by total departures
+  symmetry_breaking: true
   # Stronger aggregated cuts by tau
   aggregate_cuts_by_tau: true
   # Use one theta per scenario (requires multi-cuts)
@@ -133,7 +133,7 @@ solver:
   stall_min_abs_improve: 1.0
   stall_min_rel_improve: 0.002
   # Backend solver names (Pyomo)
-  master_solver: cplex_persistent
+  master_solver: cplex
   subproblem_solver: cplex_direct
   # Emit solver logs during MP solves
   solver_tee: false
@@ -142,7 +142,7 @@ solver:
 Requirements (runtime)
 - Python 3.10 venv with `pyomo` available (models are built with Pyomo).
 - A MILP/LP solver supported by Pyomo. Default config uses CPLEX:
-- Master: `solver.master_solver` (default `cplex_persistent`)
+- Master: `solver.master_solver` (default `cplex`)
 - Subproblem: `solver.subproblem_solver` (default `cplex_direct`)
 - `pyyaml` is required if you load YAML configs or demand files.
 

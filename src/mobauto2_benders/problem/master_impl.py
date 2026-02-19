@@ -1,21 +1,13 @@
 from __future__ import annotations
 
 from typing import Any, Optional
+from datetime import datetime
 from pathlib import Path
 
 import pyomo.environ as pyo
 
 from ..benders.master import MasterProblem
-from ..benders.subproblem import Subproblem
-from ..benders.types import SubproblemResult
 from ..benders.solver import add_benders_cut  # shared cut filtering
-
-try:  # Optional import for CPLEX lazy callbacks
-    import cplex  # type: ignore
-    from cplex.callbacks import LazyConstraintCallback  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
-    cplex = None
-    LazyConstraintCallback = object  # type: ignore
 from ..benders.types import Candidate, Cut, SolveResult, SolveStatus
 
 
@@ -27,15 +19,32 @@ class ProblemMaster(MasterProblem):
         self._lb: Optional[float] = None
         # Fingerprints of cuts to avoid duplicates
         self._cut_fps: set[tuple] = set()
-        self._lazy_installed: bool = False
         # Optional: warm start values for yOUT/yRET at next solve
         # Keys: ("yOUT"|"yRET", q:int, t:int) -> float(0/1)
         self._warm_start: dict[tuple[str, int, int], float] | None = None
+        # Optional: MIP start values from previous iteration
+        self._last_solution: dict[str, float] | None = None
 
     def _p(self, key: str, default: Any | None = None) -> Any:
         if self.params is None:
             return default
         return self.params.get(key, default)
+
+    def _extract_solver_stats(self, res) -> dict[str, Any]:
+        stats: dict[str, Any] = {}
+        try:
+            stats["termination_condition"] = getattr(res.solver, "termination_condition", None)
+            stats["status"] = getattr(res.solver, "status", None)
+            stats["solver_time"] = getattr(res.solver, "time", None)
+            stats["wall_time"] = getattr(res.solver, "wall_time", None)
+            stats["iterations"] = getattr(res.solver, "iterations", None)
+            stats["nodes"] = getattr(res.solver, "nodes", None)
+            stats["gap"] = getattr(res.solver, "gap", None)
+            stats["best_bound"] = getattr(res.solver, "best_bound", None)
+            stats["incumbent"] = getattr(res.solver, "objective", None)
+        except Exception:
+            pass
+        return stats
 
     def initialize(self) -> None:
         Q = int(self._p("Q"))
@@ -246,6 +255,29 @@ class ProblemMaster(MasterProblem):
                         ),
                     )
 
+        # Symmetry breaking: order vehicles by cumulative departures (OUT+RET)
+        if bool(self._p("symmetry_breaking", False)) and Q >= 2:
+            for k in range(Q - 1):
+                # Cumulative ordering by time prefix
+                for t in range(T):
+                    m.add_component(
+                        f"C_sym_break_pref_{k}_{t}",
+                        pyo.Constraint(
+                            expr=
+                            sum(m.yOUT[k, tau] + m.yRET[k, tau] for tau in range(0, t + 1))
+                            >= sum(m.yOUT[k + 1, tau] + m.yRET[k + 1, tau] for tau in range(0, t + 1))
+                        ),
+                    )
+                # Redundant total-ordering reinforcement
+                m.add_component(
+                    f"C_sym_break_tot_{k}",
+                    pyo.Constraint(
+                        expr=
+                        sum(m.yOUT[k, t] + m.yRET[k, t] for t in m.T)
+                        >= sum(m.yOUT[k + 1, t] + m.yRET[k + 1, t] for t in m.T)
+                    ),
+                )
+
         for q in m.Q:
             m.b[q, 0].fix(float(binit[q]))
             for t in range(T - 1):
@@ -278,18 +310,17 @@ class ProblemMaster(MasterProblem):
 
         self.m = m
 
-        # Create and retain a solver; if persistent CPLEX, set instance once
-        solver_name = str(self._p("solver", "cplex_persistent"))
+        # Create and retain a standard (non-persistent) solver
+        backend = str(self._p("solver_backend", "")).strip()
+        if backend:
+            solver_name = backend
+        else:
+            solver_name = str(self._p("solver", "cplex"))
         self._solver = pyo.SolverFactory(solver_name)
-        self._is_persistent = solver_name.lower() == "cplex_persistent"
-        if self._is_persistent:
-            # If using lazy cuts, we need symbolic labels to resolve indices by name
-            use_lazy = bool(self._p("use_lazy_cuts", False))
-            self._solver.set_instance(self.m, symbolic_solver_labels=use_lazy)
-            # Set solver options once here
-            opts = self._p("solver_options", {}) or {}
-            for k, v in opts.items():
-                self._solver.options[k] = v
+        # Set solver options once here
+        opts = self._p("solver_options", {}) or {}
+        for k, v in opts.items():
+            self._solver.options[k] = v
 
     # Allow external code (CLI) to provide a warm-start schedule at the new resolution
     # Starts should be a dict with keys ("yOUT"|"yRET", q, t) and values in {0,1}
@@ -300,227 +331,33 @@ class ProblemMaster(MasterProblem):
         assert self.m is not None
         return self._solver
 
-    # Optional: install a CPLEX lazy-constraint callback that generates Benders cuts
-    # on-the-fly from the provided Subproblem implementation. Requires persistent CPLEX.
-    def install_lazy_callback(self, subproblem: Subproblem) -> None:
-        assert self.m is not None
-        if str(self._p("solver", "")).lower() != "cplex_persistent":
-            try:
-                print("[BENDERS] Lazy cuts require solver=cplex_persistent; skipping callback install.")
-            except Exception:
-                pass
-            return
-        solver = self._get_solver()
-        # Access underlying CPLEX model
-        cpx = getattr(solver, "_solver_model", None)
-        if (cplex is None) or (cpx is None):
-            try:
-                print("[BENDERS] CPLEX Python API not available; skipping lazy cuts.")
-            except Exception:
-                pass
-            return
-
-        m = self.m
-        T = list(m.T)
-        Q = list(m.Q)
-
-        # Prepare variable names and indices in CPLEX
-        theta_name = "theta"
-        yout_names = [f"yOUT[{q},{t}]" for q in Q for t in T]
-        yret_names = [f"yRET[{q},{t}]" for q in Q for t in T]
-        Yout_names = [f"Yout[{t}]" for t in T]
-        Yret_names = [f"Yret[{t}]" for t in T]
-
-        try:
-            idx_theta = cpx.variables.get_indices(theta_name)
-            idx_yout = cpx.variables.get_indices(yout_names)
-            idx_yret = cpx.variables.get_indices(yret_names)
-            idx_Yout = cpx.variables.get_indices(Yout_names)
-            idx_Yret = cpx.variables.get_indices(Yret_names)
-        except Exception:
-            # Ensure symbolic labels were used
-            try:
-                print("[BENDERS] Could not resolve variable indices by name; ensure symbolic_solver_labels=True.")
-            except Exception:
-                pass
-            return
-
-        # Build mappings from (q,t) and t to indices for fast lookup
-        yout_index: dict[tuple[int, int], int] = {}
-        yret_index: dict[tuple[int, int], int] = {}
-        for i, q in enumerate(Q):
-            for j, t in enumerate(T):
-                pos = i * len(T) + j
-                yout_index[(q, t)] = idx_yout[pos]
-                yret_index[(q, t)] = idx_yret[pos]
-        Yout_index: dict[int, int] = {t: idx_Yout[i] for i, t in enumerate(T)}
-        Yret_index: dict[int, int] = {t: idx_Yret[i] for i, t in enumerate(T)}
-
-        # Allow overriding the LP solver used by the subproblem inside the callback
-        lp_override = str(self._p("lazy_cb_lp_solver", "")).strip() or None
-
-        # Register callback
-        class _BendersLazyCB(LazyConstraintCallback):  # type: ignore
-            def __call__(self):  # noqa: D401
-                # Build candidate from current integer solution
-                cand: dict[str, float] = {}
-                # yOUT
-                for q in Q:
-                    for t in T:
-                        idx = yout_index[(q, t)]
-                        try:
-                            val = float(self.get_values(idx))
-                        except Exception:
-                            val = 0.0
-                        cand[f"yOUT[{q},{t}]"] = val
-                # yRET
-                for q in Q:
-                    for t in T:
-                        idx = yret_index[(q, t)]
-                        try:
-                            val = float(self.get_values(idx))
-                        except Exception:
-                            val = 0.0
-                        cand[f"yRET[{q},{t}]"] = val
-
-                # Evaluate subproblem to get a cut at this candidate
-                # Optionally override LP solver inside callback to avoid nested CPLEX
-                old_lp = None
-                try:
-                    if lp_override is not None:
-                        old_lp = subproblem.params.get("lp_solver")
-                        subproblem.params["lp_solver"] = lp_override
-                except Exception:
-                    pass
-                try:
-                    sres: SubproblemResult = subproblem.evaluate(cand)
-                except Exception:
-                    # If SP fails, skip adding lazy cut
-                    return
-                finally:
-                    try:
-                        if lp_override is not None and old_lp is not None:
-                            subproblem.params["lp_solver"] = old_lp
-                    except Exception:
-                        pass
-                cuts = []
-                if sres.cut is not None:
-                    cuts.append(sres.cut)
-                if getattr(sres, "cuts", None):
-                    cuts.extend(sres.cuts)
-                if not cuts:
-                    return
-
-                # We only add the first violated cut (can be extended to add multiple)
-                cut = cuts[0]
-                const = float(cut.metadata.get("const", 0.0)) if hasattr(cut, "metadata") else 0.0
-                coeff_yOUT = cut.metadata.get("coeff_yOUT") if hasattr(cut, "metadata") else None
-                coeff_yRET = cut.metadata.get("coeff_yRET") if hasattr(cut, "metadata") else None
-
-                # Aggregate per time coefficients (raw dm) for Yout/Yret
-                coeff_out_t: dict[int, float] = {}
-                coeff_ret_t: dict[int, float] = {}
-                if isinstance(coeff_yOUT, dict):
-                    for (q, t), v in coeff_yOUT.items():
-                        if t not in coeff_out_t:
-                            coeff_out_t[t] = float(v)
-                if isinstance(coeff_yRET, dict):
-                    for (q, t), v in coeff_yRET.items():
-                        if t not in coeff_ret_t:
-                            coeff_ret_t[t] = float(v)
-
-                # Re-anchor constant to pass through incumbent in Y-space
-                # ub_est = const_dm + sum(dm*y_curr) using raw dm from metadata
-                ub_est = float(const)
-                if isinstance(coeff_yOUT, dict):
-                    for (q, t), v in coeff_yOUT.items():
-                        ub_est += float(v) * float(self.get_values(yout_index[(q, t)]))
-                if isinstance(coeff_yRET, dict):
-                    for (q, t), v in coeff_yRET.items():
-                        ub_est += float(v) * float(self.get_values(yret_index[(q, t)]))
-                # Keep const as provided (already passes through incumbent)
-                const = float(const)
-
-                # Build LHS: theta - sum_t (dm_out[t]*Yout[t] + dm_ret[t]*Yret[t]) >= const
-                inds: list[int] = [idx_theta]
-                vals: list[float] = [1.0]
-                for t, a in coeff_out_t.items():
-                    if t in Yout_index:
-                        inds.append(Yout_index[t])
-                        vals.append(-float(a))
-                for t, a in coeff_ret_t.items():
-                    if t in Yret_index:
-                        inds.append(Yret_index[t])
-                        vals.append(-float(a))
-
-                # Check violation at current solution using Option A: viol = RHS - LHS
-                lhs_val = 0.0
-                try:
-                    lhs_val += float(self.get_values(idx_theta))
-                except Exception:
-                    pass
-                for idx, coef in zip(inds[1:], vals[1:]):
-                    try:
-                        lhs_val += coef * float(self.get_values(idx))
-                    except Exception:
-                        pass
-                rhs_val = float(const)
-                # Build slopes map over y-variable indices (β for RHS representation)
-                slopes = {}
-                for t, a in coeff_out_t.items():
-                    if t in Yout_index:
-                        slopes[Yout_index[t]] = float(a)
-                for t, a in coeff_ret_t.items():
-                    if t in Yret_index:
-                        slopes[Yret_index[t]] = float(a)
-                # Use shared filter (logs and deduplicates)
-                if not add_benders_cut(iteration=0, const=float(const), slopes=slopes, lhs_value=lhs_val, rhs_value=rhs_val, cut_type="optimality"):
-                    return
-
-                # Add lazy constraint
-                try:
-                    spair = cplex.SparsePair(ind=inds, val=vals)
-                    self.add(spair, "G", const)
-                except Exception:
-                    # Alternate signature fallback
-                    try:
-                        self.add(inds, vals, "G", const)
-                    except Exception:
-                        pass
-
-        cb = cpx.register_callback(_BendersLazyCB)  # noqa: F841
-        self._lazy_installed = True
-        print("[BENDERS] Installed CPLEX lazy constraint callback for Benders cuts.")
-
-    def _collect_candidate(self) -> Candidate:
-        assert self.m is not None
-        m = self.m
-        cand: Candidate = {}
-        for q in m.Q:
-            for t in m.T:
-                cand[f"yOUT[{q},{t}]"] = pyo.value(m.yOUT[q, t])
-                cand[f"yRET[{q},{t}]"] = pyo.value(m.yRET[q, t])
-        # Report total theta for compatibility
-        try:
-            if hasattr(m, "theta"):
-                cand["theta"] = pyo.value(m.theta)
-            elif hasattr(m, "theta_s"):
-                # Sum across scenarios for a single comparable number
-                try:
-                    cand["theta"] = sum(float(pyo.value(m.theta_s[s])) for s in getattr(m, "Scenarios", []))
-                except Exception:
-                    cand["theta"] = 0.0
-            else:
-                cand["theta"] = float(pyo.value(m.theta_out)) + float(pyo.value(m.theta_ret))
-        except Exception:
-            cand["theta"] = 0.0
-        return cand
-
     def solve(self) -> SolveResult:
         assert self.m is not None, "Call initialize() before solve()"
         m = self.m
         solver = self._get_solver()
         tee_flag = bool(self._p("solver_tee", self._p("mp_solve_tee", False)))
+        # Per-iteration solver controls
+        try:
+            time_limit = self._p("solve_time_limit_s")
+            if time_limit is not None:
+                solver.options["timelimit"] = float(time_limit)
+            mipgap = self._p("mipgap")
+            if mipgap is not None:
+                solver.options["mipgap"] = float(mipgap)
+            cplex_opts = self._p("cplex_options", {}) or {}
+            backend = str(self._p("solver_backend", "")).lower()
+            # CPLEX file-based plugin accepts CPXPARAM_* keys; cplex_direct does not.
+            if backend in ("cplex", ""):
+                for k, v in cplex_opts.items():
+                    solver.options[k] = v
+            else:
+                # Skip CPXPARAM_* for cplex_direct to avoid AttributeError.
+                for k, v in cplex_opts.items():
+                    if str(k).upper().startswith("CPXPARAM_"):
+                        continue
+                    solver.options[k] = v
+        except Exception:
+            pass
         # Apply warm start if provided: set initial y values and aggregated Yout/Yret
         use_ws = False
         if self._warm_start:
@@ -621,44 +458,101 @@ class ProblemMaster(MasterProblem):
             finally:
                 # Clear after applying to avoid reusing stale starts in later solves
                 self._warm_start = None
-        if getattr(self, "_is_persistent", False):
-            # Persistent: do not pass model; allow warmstart
-            # If we built a binary warm start, also push an explicit CPLEX MIP start
-            if use_ws:
-                try:
-                    cpx = getattr(solver, "_solver_model", None)
-                    if (cpx is not None) and (cplex is not None):
-                        inds: list[int] = []
-                        vals: list[float] = []
-                        # yOUT / yRET indices by name
-                        for (q, t), vv in list(_yout_qt.items()) + []:
-                            try:
-                                idx = cpx.variables.get_indices(f"yOUT[{int(q)},{int(t)}]")
-                                inds.append(idx)
-                                vals.append(float(vv))
-                            except Exception:
-                                pass
-                        for (q, t), vv in list(_yret_qt.items()) + []:
-                            try:
-                                idx = cpx.variables.get_indices(f"yRET[{int(q)},{int(t)}]")
-                                inds.append(idx)
-                                vals.append(float(vv))
-                            except Exception:
-                                pass
-                        if inds:
-                            try:
-                                spair = cplex.SparsePair(ind=inds, val=vals)
-                                cpx.MIP_starts.add(spair, cpx.MIP_starts.effort_level.auto, "warmstart")
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-            res = solver.solve(tee=tee_flag, warmstart=use_ws)
-        else:
-            res = solver.solve(m, tee=tee_flag, warmstart=use_ws)
+        # Use previous master solution as MIP start if enabled and no explicit warm start
+        if (not use_ws) and bool(self._p("use_mip_start", False)) and self._last_solution:
+            try:
+                for name, val in self._last_solution.items():
+                    if name.startswith("yOUT["):
+                        inside = name[name.find("[") + 1 : name.find("]")]
+                        q_str, t_str = inside.split(",")
+                        q = int(q_str.strip())
+                        t = int(t_str.strip())
+                        m.yOUT[q, t].value = float(val)
+                    elif name.startswith("yRET["):
+                        inside = name[name.find("[") + 1 : name.find("]")]
+                        q_str, t_str = inside.split(",")
+                        q = int(q_str.strip())
+                        t = int(t_str.strip())
+                        m.yRET[q, t].value = float(val)
+                    elif name.startswith("atL["):
+                        inside = name[name.find("[") + 1 : name.find("]")]
+                        q_str, t_str = inside.split(",")
+                        q = int(q_str.strip())
+                        t = int(t_str.strip())
+                        m.atL[q, t].value = float(val)
+                    elif name.startswith("atM["):
+                        inside = name[name.find("[") + 1 : name.find("]")]
+                        q_str, t_str = inside.split(",")
+                        q = int(q_str.strip())
+                        t = int(t_str.strip())
+                        m.atM[q, t].value = float(val)
+                    elif name.startswith("inTrip["):
+                        inside = name[name.find("[") + 1 : name.find("]")]
+                        q_str, t_str = inside.split(",")
+                        q = int(q_str.strip())
+                        t = int(t_str.strip())
+                        m.inTrip[q, t].value = float(val)
+                use_ws = True
+            except Exception:
+                use_ws = False
+        # Diagnostics: write LP and enable solver logs
+        try:
+            out_dir = Path(self._p("lp_output_dir", "Report"))
+            out_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            lp_path = out_dir / f"master_iter_{self._cut_idx}_{ts}.lp"
+            m.write(str(lp_path), io_options={"symbolic_solver_labels": True})
+            print(f"[MP] Wrote LP: {lp_path}")
+        except Exception:
+            lp_path = None
+
+        log_path = None
+        try:
+            out_dir = Path(self._p("lp_output_dir", "Report"))
+            out_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_path = out_dir / f"master_iter_{self._cut_idx}_{ts}.log"
+            backend = str(self._p("solver_backend", "")).lower()
+            if backend in ("cplex", ""):
+                solver.options["logfile"] = str(log_path)
+        except Exception:
+            log_path = None
+
+        res = solver.solve(
+            m,
+            tee=True,
+            warmstart=use_ws,
+            load_solutions=True,
+            keepfiles=True,
+            symbolic_solver_labels=True,
+        )
+        try:
+            m.solutions.load_from(res)
+        except Exception:
+            pass
 
         term = getattr(res.solver, "termination_condition", None)
         st = getattr(res.solver, "status", None)
+        try:
+            best_bound = getattr(res.solver, "best_bound", None)
+        except Exception:
+            best_bound = None
+        try:
+            incumbent = getattr(res.solver, "objective", None)
+        except Exception:
+            incumbent = None
+        print(
+            "MP raw solver: status=%s term=%s incumbent=%s best_bound=%s"
+            % (str(st), str(term), str(incumbent), str(best_bound))
+        )
+        try:
+            sol_len = len(getattr(res, "solution", []))
+            sol_keys = list(getattr(res, "solution", {}).keys()) if hasattr(res, "solution") else []
+            print(f"MP solutions: count={sol_len} keys={sol_keys}")
+        except Exception:
+            pass
+        if log_path is not None:
+            print(f"[MP] Solver log: {log_path}")
         if term in (pyo.TerminationCondition.optimal,):
             status = SolveStatus.OPTIMAL
         elif term in (pyo.TerminationCondition.feasible, pyo.TerminationCondition.maxTimeLimit):
@@ -671,11 +565,108 @@ class ProblemMaster(MasterProblem):
         else:
             status = SolveStatus.UNKNOWN
 
+        # If no incumbent solution exists, treat as UNKNOWN and avoid using candidate
+        has_incumbent = False
+        try:
+            has_incumbent = bool(getattr(res, "solution", []))
+        except Exception:
+            has_incumbent = False
+        if not has_incumbent and status in (SolveStatus.FEASIBLE, SolveStatus.OPTIMAL):
+            status = SolveStatus.UNKNOWN
+
         # Use full master objective as lower bound on total cost (first-stage + recourse proxy)
-        objective = float(pyo.value(m.obj))
-        self._lb = objective
+        val_obj = pyo.value(m.obj, exception=False)
+        if val_obj is None:
+            objective = None
+            self._lb = None
+        else:
+            objective = float(val_obj)
+            self._lb = objective
+
+        # Assert representative variable has a value
+        try:
+            rep_val = pyo.value(m.yOUT[0, 0], exception=False)
+            if rep_val is None:
+                raise RuntimeError(
+                    "Master solve did not load variable values. Check solver log/LP for details."
+                )
+        except Exception as exc:
+            raise RuntimeError(
+                "Master solve did not load variable values. Check solver log/LP for details."
+            ) from exc
+
+        # Sanity: if we have any cuts, at least one y should be nonzero
+        try:
+            if self._cut_idx > 0:
+                nonzero = False
+                for q in m.Q:
+                    for t in m.T:
+                        if float(m.yOUT[q, t].value or 0.0) > 1e-6 or float(m.yRET[q, t].value or 0.0) > 1e-6:
+                            nonzero = True
+                            break
+                    if nonzero:
+                        break
+                if not nonzero:
+                    print("[WARN] Master has cuts but all y are zero.")
+        except Exception:
+            pass
+        self._last_solve_stats = self._extract_solver_stats(res)
+        # Print per-shuttle total departures to confirm symmetry constraints are active
+        try:
+            totals = []
+            for q in m.Q:
+                tot_q = sum(float(m.yOUT[q, t].value or 0.0) + float(m.yRET[q, t].value or 0.0) for t in m.T)
+                totals.append(tot_q)
+            print("Shuttle totals (OUT+RET): " + ", ".join(f"q{idx}={tot:.0f}" for idx, tot in enumerate(totals)))
+        except Exception:
+            pass
+        # Store solution values for next MIP start (binary vars)
+        try:
+            sol: dict[str, float] = {}
+            for q in m.Q:
+                for t in m.T:
+                    sol[f"yOUT[{int(q)},{int(t)}]"] = float(m.yOUT[q, t].value or 0.0)
+                    sol[f"yRET[{int(q)},{int(t)}]"] = float(m.yRET[q, t].value or 0.0)
+                    sol[f"atL[{int(q)},{int(t)}]"] = float(m.atL[q, t].value or 0.0)
+                    sol[f"atM[{int(q)},{int(t)}]"] = float(m.atM[q, t].value or 0.0)
+                    sol[f"inTrip[{int(q)},{int(t)}]"] = float(m.inTrip[q, t].value or 0.0)
+            self._last_solution = sol
+        except Exception:
+            self._last_solution = None
+        try:
+            stats = dict(self._last_solve_stats or {})
+            nodes = stats.get("nodes")
+            best_bound = stats.get("best_bound")
+            incumbent = stats.get("incumbent")
+            gap = stats.get("gap")
+            if nodes is not None or best_bound is not None or incumbent is not None or gap is not None:
+                print(
+                    "MP stats (solver): nodes=%s best_bound=%s incumbent=%s gap=%s"
+                    % (str(nodes), str(best_bound), str(incumbent), str(gap))
+                )
+        except Exception:
+            pass
         candidate = self._collect_candidate()
         return SolveResult(status=status, objective=objective, candidate=candidate, lower_bound=self._lb)
+
+    def last_solve_stats(self) -> dict[str, Any]:
+        return dict(getattr(self, "_last_solve_stats", {}) or {})
+
+    def _collect_candidate(self) -> Candidate:
+        assert self.m is not None
+        m = self.m
+        cand: Candidate = {}
+        for q in m.Q:
+            for t in m.T:
+                try:
+                    cand[f"yOUT[{int(q)},{int(t)}]"] = float(m.yOUT[q, t].value or 0.0)
+                except Exception:
+                    cand[f"yOUT[{int(q)},{int(t)}]"] = 0.0
+                try:
+                    cand[f"yRET[{int(q)},{int(t)}]"] = float(m.yRET[q, t].value or 0.0)
+                except Exception:
+                    cand[f"yRET[{int(q)},{int(t)}]"] = 0.0
+        return cand
 
     # Pretty-print the current master solution (if solved)
     def format_solution(self) -> str:
@@ -946,10 +937,16 @@ class ProblemMaster(MasterProblem):
             lhs_ret = m.theta_ret
 
             # Violation values and shared filter per direction
-            lhs_out_val = float(pyo.value(lhs_out))
-            rhs_out_val = float(pyo.value(rhs_out))
-            lhs_ret_val = float(pyo.value(lhs_ret))
-            rhs_ret_val = float(pyo.value(rhs_ret))
+            lhs_out_val = pyo.value(lhs_out, exception=False)
+            rhs_out_val = pyo.value(rhs_out, exception=False)
+            lhs_ret_val = pyo.value(lhs_ret, exception=False)
+            rhs_ret_val = pyo.value(rhs_ret, exception=False)
+            if lhs_out_val is None or rhs_out_val is None or lhs_ret_val is None or rhs_ret_val is None:
+                return False
+            lhs_out_val = float(lhs_out_val)
+            rhs_out_val = float(rhs_out_val)
+            lhs_ret_val = float(lhs_ret_val)
+            rhs_ret_val = float(rhs_ret_val)
             if aggregate:
                 slopes_out = {("Yout", int(t)): float(v) for t, v in agg_out.items()}
                 slopes_ret = {("Yret", int(t)): float(v) for t, v in agg_ret.items()}
@@ -986,14 +983,20 @@ class ProblemMaster(MasterProblem):
             else:
                 lhs = m.theta
             rhs_scaled = rhs
-            lhs_val = float(pyo.value(lhs))
-            rhs_val = float(pyo.value(rhs_scaled))
+            lhs_val = pyo.value(lhs, exception=False)
+            rhs_val = pyo.value(rhs_scaled, exception=False)
+            if lhs_val is None or rhs_val is None:
+                return False
+            lhs_val = float(lhs_val)
+            rhs_val = float(rhs_val)
             if aggregate:
                 slopes_all = {("Yout", int(t)): float(v) for t, v in agg_out.items()}
                 slopes_all.update({("Yret", int(t)): float(v) for t, v in agg_ret.items()})
             else:
                 slopes_all = {("yOUT", int(q), int(t)): float(v) for (q, t), v in agg_out.items()}  # type: ignore[misc]
                 slopes_all.update({("yRET", int(q), int(t)): float(v) for (q, t), v in agg_ret.items()})  # type: ignore[misc]
+            if lhs_val is None or rhs_val is None:
+                return False
             if not force:
                 ok = add_benders_cut(
                     iteration=-1,
@@ -1009,7 +1012,7 @@ class ProblemMaster(MasterProblem):
 
         # Duplicate check handled by add_benders_cut
 
-        # Create explicit constraint(s) and register with persistent solver if used
+        # Create explicit constraint(s)
         if hasattr(m, "theta_out") and hasattr(m, "theta_ret") and (const_adj_out is not None) and (const_adj_ret is not None):
             con_list = []
             name_list = []
@@ -1018,8 +1021,6 @@ class ProblemMaster(MasterProblem):
                 cname_out = f"benders_cut_out_{self._cut_idx}"
                 con_out = pyo.Constraint(expr=(m.theta_out >= rhs_out))
                 setattr(m.BendersCuts, cname_out, con_out)
-                if getattr(self, "_is_persistent", False):
-                    self._solver.add_constraint(con_out)
                 con_list.append(con_out)
                 name_list.append(cname_out)
             # RET direction
@@ -1027,8 +1028,6 @@ class ProblemMaster(MasterProblem):
                 cname_ret = f"benders_cut_ret_{self._cut_idx}"
                 con_ret = pyo.Constraint(expr=(m.theta_ret >= rhs_ret))
                 setattr(m.BendersCuts, cname_ret, con_ret)
-                if getattr(self, "_is_persistent", False):
-                    self._solver.add_constraint(con_ret)
                 con_list.append(con_ret)
                 name_list.append(cname_ret)
         else:
@@ -1040,8 +1039,6 @@ class ProblemMaster(MasterProblem):
             rhs_scaled = rhs
             con = pyo.Constraint(expr=(lhs >= rhs_scaled))
             setattr(m.BendersCuts, cname, con)
-            if getattr(self, "_is_persistent", False):
-                self._solver.add_constraint(con)
             con_list = [con]
             name_list = [cname]
         # Maintain pool for optional pruning
@@ -1060,8 +1057,6 @@ class ProblemMaster(MasterProblem):
             for _ in range(to_remove):
                 con_old = self._cut_cons.pop(0)
                 name_old = self._cut_names.pop(0)
-                if getattr(self, "_is_persistent", False):
-                    self._solver.remove_constraint(con_old)
                 # Remove from Pyomo block
                 try:
                     delattr(m.BendersCuts, name_old)
@@ -1074,23 +1069,13 @@ class ProblemMaster(MasterProblem):
                 out_dir = Path(self._p("lp_output_dir", "Report"))
                 out_dir.mkdir(parents=True, exist_ok=True)
                 lp_path = out_dir / f"master_after_cut_{self._cut_idx}.lp"
-                # Prefer underlying CPLEX model if persistent, else use Pyomo writer
                 wrote = False
-                if getattr(self, "_is_persistent", False):
-                    try:
-                        cpx = getattr(self._solver, "_solver_model", None)
-                        if cpx is not None:
-                            cpx.write(str(lp_path))
-                            wrote = True
-                    except Exception:
-                        wrote = False
-                if not wrote:
-                    try:
-                        # Fall back to Pyomo's model writer
-                        m.write(str(lp_path), io_options={"symbolic_solver_labels": True})
-                        wrote = True
-                    except Exception:
-                        wrote = False
+                try:
+                    # Fall back to Pyomo's model writer
+                    m.write(str(lp_path), io_options={"symbolic_solver_labels": True})
+                    wrote = True
+                except Exception:
+                    wrote = False
                 if wrote:
                     print(f"[BENDERS] Wrote LP to {lp_path}")
                 # Also write a symbolic LP via Pyomo for readability
@@ -1221,5 +1206,3 @@ class ProblemMaster(MasterProblem):
     def last_cut_info(self) -> tuple[float | None, int | None]:
         return getattr(self, "_last_cut_const", None), getattr(self, "_last_cut_nnz", None)
 
-    def lazy_installed(self) -> bool:
-        return bool(self._lazy_installed)

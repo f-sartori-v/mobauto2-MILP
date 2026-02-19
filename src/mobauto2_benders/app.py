@@ -83,8 +83,17 @@ def _prepare_params(cfg, overrides: dict | None) -> tuple[dict, dict]:
     _set_if_not_none(mp, "start_cost_epsilon", costs.start_cost_epsilon)
     _set_if_not_none(mp, "concurrency_penalty", costs.concurrency_penalty)
 
-    mp["use_lazy_cuts"] = bool(cfg.master.use_lazy_cuts)
     mp["use_fifo_symmetry"] = bool(cfg.master.use_fifo_symmetry)
+    mp["symmetry_breaking"] = bool(cfg.master.symmetry_breaking)
+    mp["use_mip_start"] = bool(cfg.master.use_mip_start)
+    if cfg.master.solve_time_limit_s is not None:
+        mp["solve_time_limit_s"] = int(cfg.master.solve_time_limit_s)
+    if cfg.master.mipgap is not None:
+        mp["mipgap"] = float(cfg.master.mipgap)
+    if cfg.master.cplex_options:
+        mp["cplex_options"] = dict(cfg.master.cplex_options)
+    if cfg.master.solver_backend:
+        mp["solver_backend"] = str(cfg.master.solver_backend)
     mp["aggregate_cuts_by_tau"] = bool(cfg.master.aggregate_cuts_by_tau)
     mp["cut_coeff_threshold"] = float(cfg.master.cut_coeff_threshold)
     mp["theta_per_scenario"] = bool(cfg.master.theta_per_scenario)
@@ -229,24 +238,35 @@ def _maybe_print_summary(result: BendersRunResult, sp: dict) -> None:
     try:
         if result.pax_served is not None and result.pax_total is not None:
             print(f"Pax served: {result.pax_served:.0f}/{result.pax_total:.0f}")
-            # Compute penalization and waiting time per served pax if we have a solution value
-            p_pen = sp.get("p", None)
-            sol_val = result.best_upper_bound
-            if p_pen is not None and sol_val is not None and result.pax_served > 0:
-                penalized = max(0.0, float(result.pax_total) - float(result.pax_served))
-                pen_cost = penalized * float(p_pen)
-                wait_per_pax = (float(sol_val) - pen_cost) / float(result.pax_served)
+        # Use subproblem diagnostics for consistent decomposition
+        if result.subproblem_obj is not None:
+            wait_slots = float(result.sp_wait_cost_slots or 0.0)
+            fill_eps = float(result.sp_fill_eps_cost or 0.0)
+            pen_cost = float(result.sp_penalty_cost or 0.0)
+            pen_pax = float(result.sp_penalty_pax or 0.0)
+            total_dem = float(result.sp_total_demand or 0.0)
+            slot_res = int(result.sp_slot_resolution or 1)
+            sum_components = wait_slots + fill_eps + pen_cost
+            if abs(sum_components - float(result.subproblem_obj)) > 1e-5:
                 print(
-                    "Solution: %.6g. Penalized pax: %.0f. Penalization: %.0f * %.6g = %.6g. Waiting time: %.6g"
-                    % (
-                        float(sol_val),
-                        penalized,
-                        penalized,
-                        float(p_pen),
-                        pen_cost,
-                        wait_per_pax,
-                    )
+                    "[DIAG] Subproblem objective mismatch: obj=%.6g wait=%.6g fill_eps=%.6g penalty=%.6g sum=%.6g"
+                    % (float(result.subproblem_obj), wait_slots, fill_eps, pen_cost, sum_components)
                 )
+            if wait_slots < -1e-9:
+                print(f"[DIAG] Negative waiting cost detected: {wait_slots:.6g}")
+            if pen_cost < -1e-9:
+                print(f"[DIAG] Negative penalty cost detected: {pen_cost:.6g}")
+            wait_per_pax_min = None
+            if result.pax_served and result.pax_served > 0:
+                wait_per_pax_min = (wait_slots * float(slot_res)) / float(result.pax_served)
+            print(
+                "Subproblem (last): obj=%.6g wait_slots=%.6g fill_eps=%.6g penalty_cost=%.6g penalty_pax=%.6g total_demand=%.6g"
+                % (float(result.subproblem_obj), wait_slots, fill_eps, pen_cost, pen_pax, total_dem)
+            )
+            if wait_per_pax_min is not None:
+                print(f"Avg wait (min): {wait_per_pax_min:.6g}")
+        if result.best_upper_bound is not None:
+            print(f"UB_total (best): {float(result.best_upper_bound):.6g}")
     except Exception:
         pass
     print(
