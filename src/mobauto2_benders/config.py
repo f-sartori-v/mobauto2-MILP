@@ -1,10 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 import ast
 import operator as _op
+import warnings
 
 try:
     import yaml as _yaml  # type: ignore
@@ -12,34 +13,123 @@ except Exception:  # pragma: no cover - optional dependency
     _yaml = None
 
 
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "default.yaml"
+
+
+# ---- Schema sections ----
+
+
 @dataclass(slots=True)
-class RunConfig:
-    max_iterations: int = 100
-    tolerance: float = 1e-4
-    time_limit_s: int = 600
+class SchemaSection:
+    name: str
+    version: int
+
+
+@dataclass(slots=True)
+class RunSection:
+    name: str | None = None
     log_level: str = "INFO"
-    seed: int = 42
-    # Optional stall-stopping controls
+    log_file: str | None = None
+    report_dir: str | None = None
+    seed: int | None = None
+
+
+@dataclass(slots=True)
+class DataSection:
+    demand_file: str | None = None
+    scenario_files: list[str] = field(default_factory=list)
+    scenario_weights: list[float] | None = None
+    R_out: list[float] | None = None
+    R_ret: list[float] | None = None
+    scenarios: list[dict[str, Any]] | None = None
+
+
+@dataclass(slots=True)
+class TimeSection:
+    T_minutes: int | None = None
+    T: int | None = None
+    slot_resolution: int = 1
+    trip_duration_minutes: int | None = None
+    trip_duration: int | None = None
+    trip_slots: int | None = None
+
+
+@dataclass(slots=True)
+class FleetSection:
+    Q: int
+    binit: list[float] | None = None
+
+
+@dataclass(slots=True)
+class EnergySection:
+    Emax: float
+    L: float
+    delta_chg: float | int | str | None = None
+
+
+@dataclass(slots=True)
+class CostSection:
+    start_cost_epsilon: float = 0.0
+    concurrency_penalty: float = 0.0
+
+
+@dataclass(slots=True)
+class ModelSection:
+    time: TimeSection
+    fleet: FleetSection
+    energy: EnergySection
+    costs: CostSection
+
+
+@dataclass(slots=True)
+class MasterSection:
+    use_lazy_cuts: bool = False
+    use_fifo_symmetry: bool = False
+    aggregate_cuts_by_tau: bool = True
+    cut_coeff_threshold: float = 0.0
+    theta_per_scenario: bool = False
+    write_lp_after_cut: bool = False
+
+
+@dataclass(slots=True)
+class SubproblemSection:
+    multi_cuts_by_scenario: bool = True
+    use_magnanti_wong: bool = False
+    mw_core_alpha: float = 0.3
+    use_dual_slopes: bool = False
+    S: float = 0.0
+    Wmax_minutes: int | None = None
+    Wmax_slots: int | None = None
+    p: float = 0.0
+    fill_first_epsilon: float = 0.0
+    unused_capacity_penalty: float = 0.0
+
+
+@dataclass(slots=True)
+class SolverSection:
+    max_iterations: int
+    tolerance: float
+    time_limit_s: int
     stall_max_no_improve_iters: int = 0
     stall_min_abs_improve: float = 0.0
     stall_min_rel_improve: float = 0.0
+    master_solver: str = "cplex_persistent"
+    subproblem_solver: str = "cplex_direct"
+    solver_tee: bool = False
 
 
 @dataclass(slots=True)
-class ComponentConfig:
-    impl: str = "to_fill"
-    params: dict[str, Any] = field(default_factory=dict)
+class RootConfig:
+    schema: SchemaSection
+    run: RunSection
+    data: DataSection
+    model: ModelSection
+    master: MasterSection
+    subproblem: SubproblemSection
+    solver: SolverSection
 
 
-@dataclass(slots=True)
-class BendersConfig:
-    run: RunConfig = field(default_factory=RunConfig)
-    master: ComponentConfig = field(default_factory=ComponentConfig)
-    subproblem: ComponentConfig = field(default_factory=ComponentConfig)
-
-
-def _as_dict(m: Mapping[str, Any] | None) -> dict[str, Any]:
-    return dict(m) if m else {}
+# ---- Expression evaluation (energy params only) ----
 
 
 def _is_number(x: Any) -> bool:
@@ -47,18 +137,7 @@ def _is_number(x: Any) -> bool:
 
 
 def _eval_expr(expr: str, names: Mapping[str, Any]) -> float | int:
-    """Safely evaluate a simple arithmetic expression with provided names.
-
-    Allowed:
-      - literals: ints and floats
-      - names: variables present in 'names' (must be numeric)
-      - operators: +, -, *, /, //, %, **
-      - parentheses and unary +/-
-
-    Disallowed: function calls, attribute access, subscripting, comprehensions, etc.
-    """
-
-    # Parse expression into AST
+    """Safely evaluate a simple arithmetic expression with provided names."""
     node = ast.parse(expr, mode="eval")
 
     bin_ops = {
@@ -88,7 +167,6 @@ def _eval_expr(expr: str, names: Mapping[str, Any]) -> float | int:
             v = names[n.id]
             if _is_number(v):
                 return v  # type: ignore[return-value]
-            # attempt to coerce numeric-looking strings
             try:
                 return float(v) if (isinstance(v, str) and v.strip()) else v  # type: ignore[return-value]
             except Exception as exc:  # noqa: BLE001
@@ -102,35 +180,121 @@ def _eval_expr(expr: str, names: Mapping[str, Any]) -> float | int:
                 raise ValueError("unary operator not allowed in expression")
             return unary_ops[type(n.op)](_eval(n.operand))
         if isinstance(n, (ast.Tuple, ast.List)) and len(getattr(n, "elts", [])) == 1:
-            # Support one-element tuple/list wrapping for safety (rare)
             return _eval(n.elts[0])  # type: ignore[index]
-        # Everything else is unsafe/not supported
         raise ValueError("unsupported syntax in expression")
 
     return _eval(node)
 
 
-def _resolve_param_expressions(params: dict[str, Any]) -> dict[str, Any]:
-    """Resolve arithmetic string expressions within a parameter dict.
+def _looks_like_expr(value: str) -> bool:
+    s = value.strip()
+    return any(ch in s for ch in "+-*/()")
 
-    Only attempts evaluation for string values that look like math expressions
-    (contain one of '+-*/()'). Leaves other values untouched. Variables can
-    reference other keys in the same dict.
-    """
-    if not params:
-        return params
-    names = dict(params)
-    out: dict[str, Any] = dict(params)
-    for k, v in params.items():
-        if isinstance(v, str):
-            s = v.strip()
-            if any(ch in s for ch in "+-*/()"):
-                try:
-                    out[k] = _eval_expr(s, names)
-                except Exception:
-                    # Leave as-is; downstream code may surface a clearer error
-                    out[k] = v
+
+def resolve_energy_params(energy: EnergySection, names: Mapping[str, Any]) -> dict[str, Any]:
+    out = {
+        "Emax": energy.Emax,
+        "L": energy.L,
+    }
+    if energy.delta_chg is not None:
+        if isinstance(energy.delta_chg, str) and _looks_like_expr(energy.delta_chg):
+            out["delta_chg"] = _eval_expr(energy.delta_chg, names)
+        else:
+            out["delta_chg"] = energy.delta_chg
     return out
+
+
+# ---- Validation helpers ----
+
+
+def _as_mapping(value: Any, where: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{where} must be a mapping")
+    return value
+
+
+def _check_unknown_keys(data: Mapping[str, Any], allowed: set[str], where: str) -> None:
+    unknown = sorted(k for k in data.keys() if k not in allowed)
+    if unknown:
+        raise ValueError(f"Unknown key(s) in {where}: {', '.join(unknown)}")
+
+
+def _require_keys(data: Mapping[str, Any], required: set[str], where: str) -> None:
+    missing = sorted(k for k in required if k not in data)
+    if missing:
+        raise ValueError(f"Missing required key(s) in {where}: {', '.join(missing)}")
+
+
+def _ensure_int(value: Any, where: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{where} must be an int")
+    try:
+        return int(value)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"{where} must be an int") from exc
+
+
+def _ensure_float(value: Any, where: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{where} must be a float")
+    try:
+        return float(value)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"{where} must be a float") from exc
+
+
+def _ensure_bool(value: Any, where: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"{where} must be a bool")
+
+
+def _ensure_str(value: Any, where: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{where} must be a string")
+    return value
+
+
+def _ensure_str_list(value: Any, where: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ValueError(f"{where} must be a list of strings")
+    return list(value)
+
+
+def _ensure_num_list(value: Any, where: str) -> list[float]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{where} must be a list of numbers")
+    out: list[float] = []
+    for v in value:
+        out.append(_ensure_float(v, where))
+    return out
+
+
+def _ensure_num_or_expr(value: Any, where: str) -> float | int | str:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if _looks_like_expr(s):
+            return s
+        try:
+            return float(s)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"{where} must be numeric or an arithmetic expression") from exc
+    raise ValueError(f"{where} must be numeric or an arithmetic expression")
+
+
+def _disallow_expr(value: Any, where: str) -> Any:
+    if isinstance(value, str) and _looks_like_expr(value):
+        raise ValueError(f"{where} cannot be an expression; provide a numeric value")
+    return value
+
+
+# ---- Load / parse ----
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -145,55 +309,435 @@ def _load_yaml(path: Path) -> dict[str, Any]:
         return data
 
 
-def load_config(path: str | Path | None) -> BendersConfig:
-    """Load configuration from a YAML file or return defaults.
+def upgrade_config_v1_to_v2(old: Mapping[str, Any]) -> dict[str, Any]:
+    """Upgrade a v1 config dict to the v2 schema.
 
-    The schema is minimal and forgiving; unknown keys are ignored. Only YAML is supported.
+    Emits warnings describing deprecated keys and their mappings.
     """
-    if path is None:
-        return BendersConfig()
-    p = Path(path)
-    if not p.exists():
-        # Return defaults but allow the CLI to keep going
-        return BendersConfig()
+    warnings_list: list[str] = []
 
-    if p.suffix.lower() not in {".yaml", ".yml"}:
-        raise ValueError(f"Unsupported config format '{p.suffix}'. Please provide a YAML file.")
-    raw = _load_yaml(p)
-    run = _as_dict(raw.get("run"))
-    master = _as_dict(raw.get("master"))
-    sub = _as_dict(raw.get("subproblem"))
+    run = _as_mapping(old.get("run", {}), "run")
+    master = _as_mapping(old.get("master", {}), "master")
+    sub = _as_mapping(old.get("subproblem", {}), "subproblem")
+    master_params = _as_mapping(master.get("params", {}), "master.params")
+    sub_params = _as_mapping(sub.get("params", {}), "subproblem.params")
 
-    run_cfg = RunConfig(
-        max_iterations=int(run.get("max_iterations", 100)),
-        tolerance=float(run.get("tolerance", 1e-4)),
-        time_limit_s=int(run.get("time_limit_s", 600)),
-        log_level=str(run.get("log_level", "INFO")),
-        seed=int(run.get("seed", 42)),
-        stall_max_no_improve_iters=int(run.get("stall_max_no_improve_iters", 0) or 0),
-        stall_min_abs_improve=float(run.get("stall_min_abs_improve", 0.0) or 0.0),
-        stall_min_rel_improve=float(run.get("stall_min_rel_improve", 0.0) or 0.0),
+    def _note(msg: str) -> None:
+        warnings_list.append(msg)
+
+    new: dict[str, Any] = {
+        "schema": {"name": "mobauto2_benders_config", "version": 2},
+        "run": {
+            "name": None,
+            "log_level": run.get("log_level", "INFO"),
+            "log_file": None,
+            "report_dir": None,
+            "seed": run.get("seed"),
+        },
+        "data": {
+            "demand_file": sub_params.get("demand_file"),
+            "scenario_files": sub_params.get("scenario_files") or [],
+            "scenario_weights": sub_params.get("scenario_weights"),
+            "R_out": sub_params.get("R_out"),
+            "R_ret": sub_params.get("R_ret"),
+        },
+        "model": {
+            "time": {
+                "T_minutes": master_params.get("T_minutes"),
+                "T": master_params.get("T"),
+                "slot_resolution": master_params.get("slot_resolution", 1),
+                "trip_duration_minutes": master_params.get("trip_duration_minutes"),
+                "trip_duration": master_params.get("trip_duration"),
+                "trip_slots": master_params.get("trip_slots"),
+            },
+            "fleet": {
+                "Q": master_params.get("Q"),
+                "binit": master_params.get("binit"),
+            },
+            "energy": {
+                "Emax": master_params.get("Emax"),
+                "L": master_params.get("L"),
+                "delta_chg": master_params.get("delta_chg"),
+            },
+            "costs": {
+                "start_cost_epsilon": master_params.get("start_cost_epsilon", 0.0),
+                "concurrency_penalty": master_params.get("concurrency_penalty", 0.0),
+            },
+        },
+        "master": {
+            "use_lazy_cuts": master_params.get("use_lazy_cuts", False),
+            "use_fifo_symmetry": master_params.get("use_fifo_symmetry", False),
+            "aggregate_cuts_by_tau": master_params.get("aggregate_cuts_by_tau", True),
+            "cut_coeff_threshold": master_params.get("cut_coeff_threshold", 0.0),
+            "theta_per_scenario": master_params.get("theta_per_scenario", False),
+            "write_lp_after_cut": master_params.get("write_lp_after_cut", False),
+        },
+        "subproblem": {
+            "multi_cuts_by_scenario": sub_params.get("multi_cuts_by_scenario", True),
+            "use_magnanti_wong": sub_params.get("use_magnanti_wong", False),
+            "mw_core_alpha": sub_params.get("mw_core_alpha", 0.3),
+            "use_dual_slopes": sub_params.get("use_dual_slopes", False),
+            "S": sub_params.get("S"),
+            "Wmax_minutes": sub_params.get("Wmax_minutes"),
+            "Wmax_slots": sub_params.get("Wmax_slots"),
+            "p": sub_params.get("p"),
+            "fill_first_epsilon": sub_params.get("fill_first_epsilon", 0.0),
+            "unused_capacity_penalty": sub_params.get("unused_capacity_penalty", 0.0),
+        },
+        "solver": {
+            "max_iterations": run.get("max_iterations", 100),
+            "tolerance": run.get("tolerance", 1e-4),
+            "time_limit_s": run.get("time_limit_s", 600),
+            "stall_max_no_improve_iters": run.get("stall_max_no_improve_iters", 0),
+            "stall_min_abs_improve": run.get("stall_min_abs_improve", 0.0),
+            "stall_min_rel_improve": run.get("stall_min_rel_improve", 0.0),
+            "master_solver": master_params.get("solver", "cplex_persistent"),
+            "subproblem_solver": sub_params.get("lp_solver", "cplex_direct"),
+            "solver_tee": master_params.get("solver_tee", False),
+        },
+    }
+
+    _note("Deprecated v1 key 'run.*' mapped to 'run.*' (logging) and 'solver.*' (iterations/tolerance/time limits).")
+    _note(f"v1 run keys: {sorted(run.keys())}")
+    _note("Deprecated v1 key 'master.params.*' mapped into 'model.*', 'master.*', and 'solver.*'.")
+    _note(f"v1 master.params keys: {sorted(master_params.keys())}")
+    _note("Deprecated v1 key 'subproblem.params.*' mapped into 'data.*', 'subproblem.*', and 'solver.*'.")
+    _note(f"v1 subproblem.params keys: {sorted(sub_params.keys())}")
+
+    if warnings_list:
+        warnings.warn(
+            "Loaded v1 config; please upgrade to schema version 2.\n" + "\n".join(warnings_list),
+            stacklevel=2,
+        )
+
+    return new
+
+
+def _parse_v2(raw: Mapping[str, Any]) -> RootConfig:
+    data = _as_mapping(raw, "config")
+    _check_unknown_keys(
+        data,
+        {"schema", "run", "data", "model", "master", "subproblem", "solver"},
+        "config",
+    )
+    _require_keys(data, {"schema", "run", "data", "model", "master", "subproblem", "solver"}, "config")
+
+    schema_raw = _as_mapping(data.get("schema"), "schema")
+    _check_unknown_keys(schema_raw, {"name", "version"}, "schema")
+    _require_keys(schema_raw, {"name", "version"}, "schema")
+    schema = SchemaSection(
+        name=_ensure_str(schema_raw.get("name"), "schema.name"),
+        version=_ensure_int(schema_raw.get("version"), "schema.version"),
+    )
+    if schema.name != "mobauto2_benders_config" or schema.version != 2:
+        raise ValueError("Unsupported schema version; expected mobauto2_benders_config v2")
+
+    run_raw = _as_mapping(data.get("run"), "run")
+    _check_unknown_keys(run_raw, {"name", "log_level", "log_file", "report_dir", "seed"}, "run")
+    run_name = run_raw.get("name")
+    run = RunSection(
+        name=(_ensure_str(run_name, "run.name") if run_name is not None else None),
+        log_level=str(run_raw.get("log_level", "INFO")),
+        log_file=run_raw.get("log_file"),
+        report_dir=run_raw.get("report_dir"),
+        seed=(_ensure_int(run_raw.get("seed"), "run.seed") if "seed" in run_raw and run_raw.get("seed") is not None else None),
     )
 
-    master_params = _as_dict(master.get("params"))
-    # Evaluate arithmetic expressions within master params (e.g., "30 * (30 / slot_resolution)")
-    master_params = _resolve_param_expressions(master_params)
-    master_cfg = ComponentConfig(
-        impl=str(master.get("impl", "to_fill")),
-        params=master_params,
+    data_raw = _as_mapping(data.get("data"), "data")
+    _check_unknown_keys(
+        data_raw,
+        {"demand_file", "scenario_files", "scenario_weights", "R_out", "R_ret", "scenarios"},
+        "data",
     )
-    sub_params = _as_dict(sub.get("params"))
-    # Propagate time discretization keys from master to subproblem if missing
-    for key in ("slot_resolution", "resolution", "T_minutes", "trip_duration", "trip_duration_minutes"):
-        if key in master_cfg.params and key not in sub_params:
-            sub_params[key] = master_cfg.params[key]
-    # Evaluate arithmetic expressions within subproblem params as well (after propagation)
-    sub_params = _resolve_param_expressions(sub_params)
-    sub_cfg = ComponentConfig(
-        impl=str(sub.get("impl", "to_fill")),
-        params=sub_params,
+    demand_file_val = data_raw.get("demand_file")
+    data_section = DataSection(
+        demand_file=(_ensure_str(demand_file_val, "data.demand_file") if demand_file_val is not None else None),
+        scenario_files=_ensure_str_list(data_raw.get("scenario_files"), "data.scenario_files"),
+        scenario_weights=(
+            _ensure_num_list(data_raw.get("scenario_weights"), "data.scenario_weights")
+            if data_raw.get("scenario_weights") is not None
+            else None
+        ),
+        R_out=(
+            _ensure_num_list(data_raw.get("R_out"), "data.R_out")
+            if data_raw.get("R_out") is not None
+            else None
+        ),
+        R_ret=(
+            _ensure_num_list(data_raw.get("R_ret"), "data.R_ret")
+            if data_raw.get("R_ret") is not None
+            else None
+        ),
+        scenarios=(data_raw.get("scenarios") if isinstance(data_raw.get("scenarios"), list) else None),
     )
-    return BendersConfig(run=run_cfg, master=master_cfg, subproblem=sub_cfg)
+
+    model_raw = _as_mapping(data.get("model"), "model")
+    _check_unknown_keys(model_raw, {"time", "fleet", "energy", "costs"}, "model")
+    _require_keys(model_raw, {"time", "fleet", "energy", "costs"}, "model")
+
+    time_raw = _as_mapping(model_raw.get("time"), "model.time")
+    _check_unknown_keys(
+        time_raw,
+        {"T_minutes", "T", "slot_resolution", "trip_duration_minutes", "trip_duration", "trip_slots"},
+        "model.time",
+    )
+    _require_keys(time_raw, {"slot_resolution"}, "model.time")
+    if "T_minutes" not in time_raw and "T" not in time_raw:
+        raise ValueError("model.time must include T_minutes or T")
+    time_section = TimeSection(
+        T_minutes=(
+            _ensure_int(_disallow_expr(time_raw.get("T_minutes"), "model.time.T_minutes"), "model.time.T_minutes")
+            if time_raw.get("T_minutes") is not None
+            else None
+        ),
+        T=(
+            _ensure_int(_disallow_expr(time_raw.get("T"), "model.time.T"), "model.time.T")
+            if time_raw.get("T") is not None
+            else None
+        ),
+        slot_resolution=_ensure_int(
+            _disallow_expr(time_raw.get("slot_resolution"), "model.time.slot_resolution"),
+            "model.time.slot_resolution",
+        ),
+        trip_duration_minutes=(
+            _ensure_int(
+                _disallow_expr(time_raw.get("trip_duration_minutes"), "model.time.trip_duration_minutes"),
+                "model.time.trip_duration_minutes",
+            )
+            if time_raw.get("trip_duration_minutes") is not None
+            else None
+        ),
+        trip_duration=(
+            _ensure_int(
+                _disallow_expr(time_raw.get("trip_duration"), "model.time.trip_duration"),
+                "model.time.trip_duration",
+            )
+            if time_raw.get("trip_duration") is not None
+            else None
+        ),
+        trip_slots=(
+            _ensure_int(
+                _disallow_expr(time_raw.get("trip_slots"), "model.time.trip_slots"),
+                "model.time.trip_slots",
+            )
+            if time_raw.get("trip_slots") is not None
+            else None
+        ),
+    )
+
+    fleet_raw = _as_mapping(model_raw.get("fleet"), "model.fleet")
+    _check_unknown_keys(fleet_raw, {"Q", "binit"}, "model.fleet")
+    _require_keys(fleet_raw, {"Q"}, "model.fleet")
+    fleet_section = FleetSection(
+        Q=_ensure_int(_disallow_expr(fleet_raw.get("Q"), "model.fleet.Q"), "model.fleet.Q"),
+        binit=(
+            _ensure_num_list(fleet_raw.get("binit"), "model.fleet.binit")
+            if fleet_raw.get("binit") is not None
+            else None
+        ),
+    )
+
+    energy_raw = _as_mapping(model_raw.get("energy"), "model.energy")
+    _check_unknown_keys(energy_raw, {"Emax", "L", "delta_chg"}, "model.energy")
+    _require_keys(energy_raw, {"Emax", "L"}, "model.energy")
+    energy_section = EnergySection(
+        Emax=_ensure_float(_disallow_expr(energy_raw.get("Emax"), "model.energy.Emax"), "model.energy.Emax"),
+        L=_ensure_float(_disallow_expr(energy_raw.get("L"), "model.energy.L"), "model.energy.L"),
+        delta_chg=(
+            _ensure_num_or_expr(energy_raw.get("delta_chg"), "model.energy.delta_chg")
+            if energy_raw.get("delta_chg") is not None
+            else None
+        ),
+    )
+
+    costs_raw = _as_mapping(model_raw.get("costs"), "model.costs")
+    _check_unknown_keys(costs_raw, {"start_cost_epsilon", "concurrency_penalty"}, "model.costs")
+    cost_section = CostSection(
+        start_cost_epsilon=(
+            _ensure_float(
+                _disallow_expr(costs_raw.get("start_cost_epsilon"), "model.costs.start_cost_epsilon"),
+                "model.costs.start_cost_epsilon",
+            )
+            if costs_raw.get("start_cost_epsilon") is not None
+            else 0.0
+        ),
+        concurrency_penalty=(
+            _ensure_float(
+                _disallow_expr(costs_raw.get("concurrency_penalty"), "model.costs.concurrency_penalty"),
+                "model.costs.concurrency_penalty",
+            )
+            if costs_raw.get("concurrency_penalty") is not None
+            else 0.0
+        ),
+    )
+
+    master_raw = _as_mapping(data.get("master"), "master")
+    _check_unknown_keys(
+        master_raw,
+        {
+            "use_lazy_cuts",
+            "use_fifo_symmetry",
+            "aggregate_cuts_by_tau",
+            "cut_coeff_threshold",
+            "theta_per_scenario",
+            "write_lp_after_cut",
+        },
+        "master",
+    )
+    master_section = MasterSection(
+        use_lazy_cuts=_ensure_bool(master_raw.get("use_lazy_cuts", False), "master.use_lazy_cuts"),
+        use_fifo_symmetry=_ensure_bool(master_raw.get("use_fifo_symmetry", False), "master.use_fifo_symmetry"),
+        aggregate_cuts_by_tau=_ensure_bool(master_raw.get("aggregate_cuts_by_tau", True), "master.aggregate_cuts_by_tau"),
+        cut_coeff_threshold=_ensure_float(
+            _disallow_expr(master_raw.get("cut_coeff_threshold", 0.0), "master.cut_coeff_threshold"),
+            "master.cut_coeff_threshold",
+        ),
+        theta_per_scenario=_ensure_bool(master_raw.get("theta_per_scenario", False), "master.theta_per_scenario"),
+        write_lp_after_cut=_ensure_bool(master_raw.get("write_lp_after_cut", False), "master.write_lp_after_cut"),
+    )
+
+    sub_raw = _as_mapping(data.get("subproblem"), "subproblem")
+    _check_unknown_keys(
+        sub_raw,
+        {
+            "multi_cuts_by_scenario",
+            "use_magnanti_wong",
+            "mw_core_alpha",
+            "use_dual_slopes",
+            "S",
+            "Wmax_minutes",
+            "Wmax_slots",
+            "p",
+            "fill_first_epsilon",
+            "unused_capacity_penalty",
+        },
+        "subproblem",
+    )
+    _require_keys(sub_raw, {"S", "p"}, "subproblem")
+    if "Wmax_minutes" not in sub_raw and "Wmax_slots" not in sub_raw:
+        raise ValueError("subproblem must include Wmax_minutes or Wmax_slots")
+    sub_section = SubproblemSection(
+        multi_cuts_by_scenario=_ensure_bool(sub_raw.get("multi_cuts_by_scenario", True), "subproblem.multi_cuts_by_scenario"),
+        use_magnanti_wong=_ensure_bool(sub_raw.get("use_magnanti_wong", False), "subproblem.use_magnanti_wong"),
+        mw_core_alpha=_ensure_float(
+            _disallow_expr(sub_raw.get("mw_core_alpha", 0.3), "subproblem.mw_core_alpha"),
+            "subproblem.mw_core_alpha",
+        ),
+        use_dual_slopes=_ensure_bool(sub_raw.get("use_dual_slopes", False), "subproblem.use_dual_slopes"),
+        S=_ensure_float(_disallow_expr(sub_raw.get("S"), "subproblem.S"), "subproblem.S"),
+        Wmax_minutes=(
+            _ensure_int(
+                _disallow_expr(sub_raw.get("Wmax_minutes"), "subproblem.Wmax_minutes"),
+                "subproblem.Wmax_minutes",
+            )
+            if sub_raw.get("Wmax_minutes") is not None
+            else None
+        ),
+        Wmax_slots=(
+            _ensure_int(
+                _disallow_expr(sub_raw.get("Wmax_slots"), "subproblem.Wmax_slots"),
+                "subproblem.Wmax_slots",
+            )
+            if sub_raw.get("Wmax_slots") is not None
+            else None
+        ),
+        p=_ensure_float(_disallow_expr(sub_raw.get("p"), "subproblem.p"), "subproblem.p"),
+        fill_first_epsilon=_ensure_float(
+            _disallow_expr(sub_raw.get("fill_first_epsilon", 0.0), "subproblem.fill_first_epsilon"),
+            "subproblem.fill_first_epsilon",
+        ),
+        unused_capacity_penalty=_ensure_float(
+            _disallow_expr(sub_raw.get("unused_capacity_penalty", 0.0), "subproblem.unused_capacity_penalty"),
+            "subproblem.unused_capacity_penalty",
+        ),
+    )
+
+    solver_raw = _as_mapping(data.get("solver"), "solver")
+    _check_unknown_keys(
+        solver_raw,
+        {
+            "max_iterations",
+            "tolerance",
+            "time_limit_s",
+            "stall_max_no_improve_iters",
+            "stall_min_abs_improve",
+            "stall_min_rel_improve",
+            "master_solver",
+            "subproblem_solver",
+            "solver_tee",
+        },
+        "solver",
+    )
+    _require_keys(solver_raw, {"max_iterations", "tolerance", "time_limit_s", "master_solver", "subproblem_solver"}, "solver")
+    solver_section = SolverSection(
+        max_iterations=_ensure_int(_disallow_expr(solver_raw.get("max_iterations"), "solver.max_iterations"), "solver.max_iterations"),
+        tolerance=_ensure_float(_disallow_expr(solver_raw.get("tolerance"), "solver.tolerance"), "solver.tolerance"),
+        time_limit_s=_ensure_int(_disallow_expr(solver_raw.get("time_limit_s"), "solver.time_limit_s"), "solver.time_limit_s"),
+        stall_max_no_improve_iters=_ensure_int(
+            _disallow_expr(solver_raw.get("stall_max_no_improve_iters", 0), "solver.stall_max_no_improve_iters"),
+            "solver.stall_max_no_improve_iters",
+        ),
+        stall_min_abs_improve=_ensure_float(
+            _disallow_expr(solver_raw.get("stall_min_abs_improve", 0.0), "solver.stall_min_abs_improve"),
+            "solver.stall_min_abs_improve",
+        ),
+        stall_min_rel_improve=_ensure_float(
+            _disallow_expr(solver_raw.get("stall_min_rel_improve", 0.0), "solver.stall_min_rel_improve"),
+            "solver.stall_min_rel_improve",
+        ),
+        master_solver=_ensure_str(solver_raw.get("master_solver"), "solver.master_solver"),
+        subproblem_solver=_ensure_str(solver_raw.get("subproblem_solver"), "solver.subproblem_solver"),
+        solver_tee=_ensure_bool(solver_raw.get("solver_tee", False), "solver.solver_tee"),
+    )
+
+    model_section = ModelSection(
+        time=time_section,
+        fleet=fleet_section,
+        energy=energy_section,
+        costs=cost_section,
+    )
+
+    return RootConfig(
+        schema=schema,
+        run=run,
+        data=data_section,
+        model=model_section,
+        master=master_section,
+        subproblem=sub_section,
+        solver=solver_section,
+    )
 
 
-__all__ = ["RunConfig", "ComponentConfig", "BendersConfig", "load_config"]
+def load_config(path: str | Path | None) -> RootConfig:
+    """Load configuration from YAML and return the v2 config dataclasses."""
+    cfg_path = DEFAULT_CONFIG_PATH if path is None else Path(path)
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Config file not found: {cfg_path}")
+    raw = _load_yaml(cfg_path)
+    if "schema" not in raw:
+        raw = upgrade_config_v1_to_v2(raw)
+    else:
+        schema_raw = raw.get("schema")
+        if not isinstance(schema_raw, dict) or schema_raw.get("version") != 2:
+            raw = upgrade_config_v1_to_v2(raw)
+    return _parse_v2(raw)
+
+
+__all__ = [
+    "SchemaSection",
+    "RunSection",
+    "DataSection",
+    "TimeSection",
+    "FleetSection",
+    "EnergySection",
+    "CostSection",
+    "ModelSection",
+    "MasterSection",
+    "SubproblemSection",
+    "SolverSection",
+    "RootConfig",
+    "DEFAULT_CONFIG_PATH",
+    "load_config",
+    "resolve_energy_params",
+    "upgrade_config_v1_to_v2",
+]

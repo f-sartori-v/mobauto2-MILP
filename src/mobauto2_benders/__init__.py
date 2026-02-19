@@ -1,4 +1,4 @@
-"""mobauto2_benders
+﻿"""mobauto2_benders
 
 A lightweight, solver-agnostic framework to implement Benders decomposition
 for the MobAuto2 project. The framework provides:
@@ -11,7 +11,7 @@ Fill in your problem-specific logic in `mobauto2_benders/problem/` by
 extending the abstract base classes.
 """
 
-from .runner import run
+from .app import run
 
 __all__ = [
     "__version__",

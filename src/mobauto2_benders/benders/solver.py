@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional, Iterable, Mapping, Any
 
-from ..config import BendersConfig
+from ..config import RootConfig
 from .core import CorePoint
 from .master import MasterProblem
 from .subproblem import Subproblem
@@ -169,15 +169,15 @@ class BendersRunResult:
 
 
 class BendersSolver:
-    def __init__(self, master: MasterProblem, subproblem: Subproblem, cfg: BendersConfig):
+    def __init__(self, master: MasterProblem, subproblem: Subproblem, cfg: RootConfig):
         self.master = master
         self.subproblem = subproblem
         self.cfg = cfg
 
     def run(self) -> BendersRunResult:
         t0 = time.time()
-        max_it = self.cfg.run.max_iterations
-        tol = self.cfg.run.tolerance
+        max_it = self.cfg.solver.max_iterations
+        tol = self.cfg.solver.tolerance
         self.master.initialize()
         print("Initialized master problem.")
 
@@ -386,10 +386,10 @@ class BendersSolver:
             last_pax_served, last_pax_total = _calc_pax_totals_from_diag(diag)
 
         # Optionally install lazy constraints callback if supported
-        use_lazy = bool(self.cfg.master.params.get("use_lazy_cuts", False))
+        use_lazy = bool(self.cfg.master.use_lazy_cuts)
         # Magnanti–Wong requires explicit separation to access the core point; disable lazy when enabled
         try:
-            if bool(self.cfg.subproblem.params.get("use_magnanti_wong", False)):
+            if bool(self.cfg.subproblem.use_magnanti_wong):
                 use_lazy = False
         except Exception:
             pass
@@ -406,15 +406,15 @@ class BendersSolver:
         best_lb: Optional[float] = None
         best_ub: Optional[float] = None
         # Stall detection on gap improvement
-        stall_max = int(getattr(self.cfg.run, "stall_max_no_improve_iters", 0) or 0)
-        stall_min_abs = float(getattr(self.cfg.run, "stall_min_abs_improve", 0.0) or 0.0)
-        stall_min_rel = float(getattr(self.cfg.run, "stall_min_rel_improve", 0.0) or 0.0)
+        stall_max = int(getattr(self.cfg.solver, "stall_max_no_improve_iters", 0) or 0)
+        stall_min_abs = float(getattr(self.cfg.solver, "stall_min_abs_improve", 0.0) or 0.0)
+        stall_min_rel = float(getattr(self.cfg.solver, "stall_min_rel_improve", 0.0) or 0.0)
         stall_ctr = 0
         prev_gap: Optional[float] = None
 
         last_diag: dict | None = None
         for it in range(1, max_it + 1):
-            if time.time() - t0 > self.cfg.run.time_limit_s:
+            if time.time() - t0 > self.cfg.solver.time_limit_s:
                 log.warning("Time limit reached after %d iterations", it - 1)
                 # Print the best incumbent information we have so far
                 try:
@@ -516,13 +516,13 @@ class BendersSolver:
 
             # Optional: update and pass a core point for Magnanti–Wong selection
             try:
-                mw_enabled = bool(self.cfg.subproblem.params.get("use_magnanti_wong", False))
+                mw_enabled = bool(self.cfg.subproblem.use_magnanti_wong)
             except Exception:
                 mw_enabled = False
             if mw_enabled:
                 # Lazy-init the core point helper with configured alpha
                 try:
-                    alpha = float(self.cfg.subproblem.params.get("mw_core_alpha", 0.3) or 0.3)
+                    alpha = float(self.cfg.subproblem.mw_core_alpha or 0.3)
                 except Exception:
                     alpha = 0.3
                 if not hasattr(self, "_core_point") or self._core_point is None:

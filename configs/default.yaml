@@ -1,111 +1,100 @@
+﻿schema:
+  name: mobauto2_benders_config
+  version: 2
+
 run:
+  # Optional run label for logs/outputs
+  name: default
+  # log_level controls verbosity: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  log_level: INFO
+  # Optional paths for log/report outputs
+  log_file: null
+  report_dir: null
+  # Optional random seed (set to null to disable)
+  seed: 42
+
+data:
+  # Demand source (preferred): file with requests or R_out/R_ret arrays
+  demand_file: setups/random.yaml
+  # Optional scenario files for multi-scenario runs
+  scenario_files: []
+  # Optional weights aligned with scenario_files
+  scenario_weights: null
+  # Optional inline demand arrays (single scenario)
+  R_out: null
+  R_ret: null
+
+model:
+  time:
+    # Total horizon length in minutes (T_minutes) or discrete slots (T)
+    T_minutes: 810
+    # Minutes per slot
+    slot_resolution: 30
+    # Trip duration in minutes (converted internally to slots)
+    trip_duration_minutes: 30
+  fleet:
+    # Number of shuttles
+    Q: 3
+    # Initial battery per shuttle (length Q)
+    binit: [150.0, 150.0, 150.0]
+  energy:
+    # Battery capacity
+    Emax: 150
+    # Energy consumed when starting a trip
+    L: 30
+    # Max charge added per slot when charging; expressions allowed here only
+    delta_chg: 70 / (60 / slot_resolution)
+  costs:
+    # Small penalty on starting trips
+    start_cost_epsilon: 0.01
+    # Small penalty per extra concurrent departure beyond 1 per slot
+    concurrency_penalty: 0.25
+
+master:
+  # Enable lazy cuts via solver callback (if supported)
+  use_lazy_cuts: false
+  # Optional FIFO symmetry-breaking across vehicles
+  use_fifo_symmetry: true
+  # Stronger aggregated cuts by tau
+  aggregate_cuts_by_tau: true
+  # Use one theta per scenario (requires multi-cuts)
+  theta_per_scenario: true
+  # Drop tiny cut coefficients to improve numerics
+  cut_coeff_threshold: 0.001
+  # Debug: write LP after each new cut
+  write_lp_after_cut: false
+
+subproblem:
+  # Multi-cuts vs averaged cut across scenarios
+  multi_cuts_by_scenario: true
+  # Magnanti–Wong selection for Pareto-optimal cuts
+  use_magnanti_wong: true
+  # Core-point mixing factor alpha in (0,1]
+  mw_core_alpha: 0.3
+  # Use dual slopes for cut generation
+  use_dual_slopes: false
+  # Capacity units contributed by one vehicle starting at time tau
+  S: 15
+  # Max waiting time in minutes or slots
+  Wmax_minutes: 30
+  # Penalty per unit of unserved demand
+  p: 50.0
+  # Tiny tie-breaker cost encouraging packing
+  fill_first_epsilon: 1.0e-6
+  # Penalty per unit of unused seat-capacity
+  unused_capacity_penalty: 0.5
+
+solver:
+  # Benders loop settings
   max_iterations: 100
   tolerance: 0.001
   time_limit_s: 600
-  # log_level controls the verbosity of Python's logging output.
-  # Options (most verbose to least): DEBUG, INFO, WARNING, ERROR, CRITICAL
-  # - DEBUG: detailed internal iteration logs
-  # - INFO: concise iteration summaries (default)
-  # - WARNING/ERROR/CRITICAL: only problems
-  log_level: INFO
-  seed: 42
-  # Optional: stop early if gap stalls
-  # Number of iterations with insufficient gap improvement before stopping (0 disables)
+  # Optional stall-based early stopping
   stall_max_no_improve_iters: 0
-  # Minimum absolute and/or relative gap improvement to reset the stall counter
   stall_min_abs_improve: 1.0
   stall_min_rel_improve: 0.002
-
-master:
-  impl: pyomo
-  params:
-    # MILP solver used by the master (Pyomo name)
-    solver: cplex_persistent
-    # Install lazy cuts via CPLEX callback (reduces full MP re-solves)
-    # Disabled to revert to the stable explicit-cut path
-    use_lazy_cuts: true
-    # Print the underlying solver's log during each MP solve
-    solver_tee: false
-
-    # Q: number of vehicles modeled in the master
-    Q: 2
-    # Time discretization is defined in minutes; slots are implicit via slot_resolution.
-    # T_minutes: total horizon length in minutes (e.g., 600)
-    T_minutes: 810
-    # slot_resolution: minutes per slot (e.g., 5 -> discrete time grid every 5 minutes)
-    slot_resolution: 30
-    # trip_duration_minutes: physical trip duration in minutes. Internally converted to slots as ceil(trip_duration_minutes / slot_resolution).
-    trip_duration_minutes: 30
-    # Emax: battery capacity (energy units)
-    Emax: 150
-    # L: energy consumed when starting a trip (units consistent with Emax). This is
-    #   NOT the number of slots; it is used in the battery balance and a guard
-    #   constraint requiring b[q,t] >= 2*L to start an OUT trip.
-    L: 30
-    # start_cost_epsilon: tiny penalty on starting trips to discourage gratuitous starts
-    #   Applied to sum_q,t (yOUT[q,t] + yRET[q,t]) in the master objective.
-    start_cost_epsilon: 0.01
-    # concurrency_penalty: optional small penalty per extra concurrent departure beyond 1 per slot
-    #   Applied to max(0, Yout[t]-1) + max(0, Yret[t]-1) and helps break ties when two trips
-    #   at the same time/direction could be consolidated into one.
-    concurrency_penalty: 0.25
-    # Optional: enable FIFO symmetry-breaking across vehicles (off by default)
-    use_fifo_symmetry: true
-    # delta_chg: maximum charge added per slot when c[q,t] = 1
-    delta_chg: 70 / (60 / slot_resolution)
-    # Use one theta per scenario (requires subproblem multi_cuts_by_scenario and scenario count)
-    theta_per_scenario: true
-    # Stronger Benders cuts (set to false to use per-(q,t) coefficients)
-    aggregate_cuts_by_tau: true
-    # Drop tiny cut coefficients (helps numerics without changing shape much)
-    cut_coeff_threshold: 0.001
-    # Debug: write LP after each new cut to inspect constraint rows
-    write_lp_after_cut: false
-    # binit: initial battery levels per vehicle (length Q)
-    binit: [150.0, 150.0]
-
-subproblem:
-  impl: pyomo_lp
-  params:
-    # LP solver used by the subproblem (Pyomo name)
-    lp_solver: cplex_direct
-    # Multi-cuts vs averaged cut across scenarios:
-    #   multi_cuts_by_scenario: true  -> one cut per scenario (recommended default)
-    #   multi_cuts_by_scenario: false -> a single cut averaged across scenarios
-    multi_cuts_by_scenario: true
-    # Magnanti–Wong selection for Pareto-optimal cuts (uses core point xbar)
-    use_magnanti_wong: true
-    # Core-point mixing factor alpha in (0,1]
-    mw_core_alpha: 0.3
-    # Use dual slopes (supporting hyperplanes ensure tight envelope)
-    use_dual_slopes: false
-    # (Optional) LP tuning can go here; keeping defaults for stability
-    # S: capacity units contributed by one vehicle starting at time tau.
-    #   Master yOUT[q,tau] adds S to C_out[tau] (similarly for yRET/C_ret).
-    S: 15
-    # Wmax can be given in slots or minutes. If Wmax_minutes is provided, it is converted to slots using slot_resolution
-    # of the master params.
-    Wmax_minutes: 30
-    # p: penalty per unit of unserved demand (drives MP to create capacity)
-    p: 50.0
-    # fill_first_epsilon: tiny tie-breaker cost that encourages packing demand
-    #   into the first vehicle at a departure time before using the next.
-    #   Keeps the subproblem linear and pushes solutions to avoid splitting
-    #   demand across multiple simultaneous vehicles unless necessary.
-    fill_first_epsilon: 1.0e-6
-    # unused_capacity_penalty: penalty per unit of unused seat-capacity
-    #   Discourages releasing a new trip while the previous departure still has slack.
-    #   Units: cost per passenger-seat per slot (e.g., 0.1–1.0). Tune to balance with waiting cost units.
-    unused_capacity_penalty: 0.5
-    # Demand source (prefer external files). Provide either:
-    #  - demand_file: path to YAML/JSON with one of:
-    #       { requests: [{dir: OUT|RET|0|1, time: int}, ...] }
-    #       { req_matrix: [[OUT|RET|0|1, time], ...] }
-    #       { R_out: [...], R_ret: [...] }
-    #  - scenario_files: list of files (each as above) for multi-scenario runs
-    demand_file: setups/random.yaml
-    #scenario_files:
-    #   - setups/demo_cont_demand_simpler.yaml
-    #   - setups/demo_cont_demand_simpler2.yaml
-    #   - setups/demo_cont_demand_simpler3.yaml
-    #   - setups/demo_cont_demand3.yaml
+  # Backend solver names (Pyomo)
+  master_solver: cplex_persistent
+  subproblem_solver: cplex_direct
+  # Emit solver logs during MP solves
+  solver_tee: false
