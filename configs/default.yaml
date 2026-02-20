@@ -34,7 +34,7 @@ model:
     trip_duration_minutes: 30
   fleet:
     # Number of shuttles
-    Q: 3
+    Q: 2
     # Initial battery per shuttle (length Q)
     binit: [150.0, 150.0, 150.0, 150.0, 150.0, 150.0, 150.0]
   energy:
@@ -110,3 +110,13 @@ solver:
   subproblem_solver: cplex_direct
   # Emit solver logs during MP solves
   solver_tee: false
+
+tolerances:
+  # Binary projection tolerance
+  eps_bin: 1.0e-6
+  # Feasibility residual tolerance
+  eps_feas: 1.0e-7
+  # Cut violation/tightness tolerance
+  eps_cut: 1.0e-8
+  # Near-duplicate cut hash tolerance
+  eps_hash: 1.0e-6

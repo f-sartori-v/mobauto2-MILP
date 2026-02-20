@@ -85,6 +85,8 @@ def _prepare_params(cfg, overrides: dict | None) -> tuple[dict, dict]:
 
     mp["use_fifo_symmetry"] = bool(cfg.master.use_fifo_symmetry)
     mp["symmetry_breaking"] = bool(cfg.master.symmetry_breaking)
+    mp["eps_bin"] = float(cfg.tolerances.eps_bin)
+    mp["eps_cut"] = float(cfg.tolerances.eps_cut)
     mp["use_mip_start"] = bool(cfg.master.use_mip_start)
     if cfg.master.solve_time_limit_s is not None:
         mp["solve_time_limit_s"] = int(cfg.master.solve_time_limit_s)
@@ -113,6 +115,8 @@ def _prepare_params(cfg, overrides: dict | None) -> tuple[dict, dict]:
     sp["p"] = cfg.subproblem.p
     sp["fill_first_epsilon"] = float(cfg.subproblem.fill_first_epsilon)
     sp["unused_capacity_penalty"] = float(cfg.subproblem.unused_capacity_penalty)
+    # tolerances
+    sp["eps_cut"] = float(cfg.tolerances.eps_cut)
 
     _set_if_not_none(sp, "demand_file", cfg.data.demand_file)
     _set_if_not_none(sp, "scenario_files", cfg.data.scenario_files if cfg.data.scenario_files else None)

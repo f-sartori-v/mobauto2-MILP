@@ -59,6 +59,7 @@ class ProblemSubproblem(Subproblem):
         else:
             Wmax = int(params.get("Wmax_slots", params.get("Wmax", 0)))
         p_pen = float(params.get("p", 0.0))
+        eps_cut = float(params.get("eps_cut", 1e-8))
         lp_solver = str(params.get("lp_solver", "cplex_direct"))
         # Optional: solver-specific options (e.g., CPLEX: {"lpmethod": 2, "threads": 0})
         solver_options = dict(params.get("solver_options", {}) or {})
@@ -268,6 +269,7 @@ class ProblemSubproblem(Subproblem):
             Returns dm_out[t], dm_ret[t] (slopes w.r.t. sum_y_out[t], sum_y_ret[t]).
             """
             md = pyo.ConcreteModel()
+            md.name = "mw_dual"
             Tset = range(T_)
 
             # Dual variables
@@ -321,10 +323,14 @@ class ProblemSubproblem(Subproblem):
                     solver.options[k] = v
             except Exception:
                 pass
-            res = solver.solve(md, tee=False)
+            res = solver.solve(md, tee=False, load_solutions=False)
             term = getattr(res.solver, "termination_condition", None)
             if term not in (pyo.TerminationCondition.optimal,):
                 return None
+            try:
+                md.solutions.load_from(res)
+            except Exception:
+                pass
 
             dm_out = {}
             dm_ret = {}
@@ -445,9 +451,9 @@ class ProblemSubproblem(Subproblem):
                 use_dual = bool(params.get("use_dual_slopes", False))
                 K_out_lp = [max(1, int(K_out[t])) for t in range(T)] if use_dual else K_out
                 K_ret_lp = [max(1, int(K_ret[t])) for t in range(T)] if use_dual else K_ret
-                sp_params = SPParams(T=T, Wmax_slots=Wmax, p=p_pen, lp_solver=lp_solver, S=S, K_out=K_out_lp, K_ret=K_ret_lp, fill_eps=fill_eps, solver_options=solver_options)
+                sp_params = SPParams(T=T, Wmax_slots=Wmax, p=p_pen, lp_solver=lp_solver, S=S, K_out=K_out_lp, K_ret=K_ret_lp, fill_eps=fill_eps, solver_options=solver_options, eps_cut=eps_cut)
                 t_solve0 = time.perf_counter()
-                duals, ub_val = solve_subproblem(sp_params, C_out, C_ret, R_out, R_ret)
+                duals, ub_val = solve_subproblem(sp_params, C_out, C_ret, R_out, R_ret, candidate)
                 t_solve1 = time.perf_counter()
                 sp_solve_time = t_solve1 - t_solve0
                 ub_vals.append(ub_val)
@@ -548,6 +554,10 @@ class ProblemSubproblem(Subproblem):
                 theta_lb_s = float(const) \
                     + sum(dm_out[t] * sum_y_out[t] for t in range(T)) \
                     + sum(dm_ret[t] * sum_y_ret[t] for t in range(T))
+                if abs(float(ub_val) - float(theta_lb_s)) > eps_cut * max(1.0, abs(float(ub_val))):
+                    raise RuntimeError(
+                        "Cut tightness failed at incumbent; aborting cut generation."
+                    )
                 cuts.append(Cut(
                     name=f"opt_cut_s_{int(idx_s)}",
                     cut_type=CutType.OPTIMALITY,
@@ -700,9 +710,9 @@ class ProblemSubproblem(Subproblem):
             use_dual = bool(params.get("use_dual_slopes", False))
             K_out_lp = [max(1, int(K_out[t])) for t in range(T)] if use_dual else K_out
             K_ret_lp = [max(1, int(K_ret[t])) for t in range(T)] if use_dual else K_ret
-            sp_params = SPParams(T=T, Wmax_slots=Wmax, p=p_pen, lp_solver=lp_solver, S=S, K_out=K_out_lp, K_ret=K_ret_lp, fill_eps=fill_eps, solver_options=solver_options)
+            sp_params = SPParams(T=T, Wmax_slots=Wmax, p=p_pen, lp_solver=lp_solver, S=S, K_out=K_out_lp, K_ret=K_ret_lp, fill_eps=fill_eps, solver_options=solver_options, eps_cut=eps_cut)
             t_solve0 = time.perf_counter()
-            duals, ub_val = solve_subproblem(sp_params, C_out, C_ret, R_out, R_ret)
+            duals, ub_val = solve_subproblem(sp_params, C_out, C_ret, R_out, R_ret, candidate)
             t_solve1 = time.perf_counter()
             sp_solve_time = t_solve1 - t_solve0
 
@@ -801,6 +811,10 @@ class ProblemSubproblem(Subproblem):
             theta_lb = float(const) \
                 + sum(dm_out[t] * sum_y_out[t] for t in range(T)) \
                 + sum(dm_ret[t] * sum_y_ret[t] for t in range(T))
+            if abs(float(ub_val) - float(theta_lb)) > eps_cut * max(1.0, abs(float(ub_val))):
+                raise RuntimeError(
+                    "Cut tightness failed at incumbent; aborting cut generation."
+                )
 
             # Emit cut metadata
             cut = Cut(
@@ -850,14 +864,23 @@ class SPParams:
     K_ret: list[int]
     fill_eps: float = 0.0
     solver_options: dict | None = None
+    eps_cut: float = 1e-8
 
 
-def solve_subproblem(P: SPParams, C_out: Iterable[float], C_ret: Iterable[float], R_out: Iterable[float], R_ret: Iterable[float]):
+def solve_subproblem(
+    P: SPParams,
+    C_out: Iterable[float],
+    C_ret: Iterable[float],
+    R_out: Iterable[float],
+    R_ret: Iterable[float],
+    candidate: Candidate | None = None,
+):
     """Replicates user's subproblem sketch and returns duals and objective.
 
     Returns (duals: dict[str, dict[int, float]], objective_value: float)
     """
     m = pyo.ConcreteModel()
+    m.name = "subproblem"
     Tset = range(P.T)
 
     C_out = list(C_out)
@@ -949,7 +972,39 @@ def solve_subproblem(P: SPParams, C_out: Iterable[float], C_ret: Iterable[float]
                 solver.options[k] = v
     except Exception:
         pass
-    solver.solve(m, tee=False)
+    res = solver.solve(m, tee=False, load_solutions=False)
+    term = getattr(res.solver, "termination_condition", None)
+    if term not in (pyo.TerminationCondition.optimal,):
+        # Retry with presolve off if possible
+        try:
+            solver.options["preind"] = 0
+            solver.options["presolve"] = 0
+            solver.options["reduce"] = 0
+        except Exception:
+            pass
+        res = solver.solve(m, tee=False, load_solutions=False)
+        term = getattr(res.solver, "termination_condition", None)
+        if term not in (pyo.TerminationCondition.optimal,):
+            try:
+                out_dir = Path("Report")
+                out_dir.mkdir(parents=True, exist_ok=True)
+                lp_path = out_dir / "subproblem_failed.lp"
+                m.write(str(lp_path), io_options={"symbolic_solver_labels": True})
+                print(f"[SP] Wrote LP: {lp_path}")
+                if candidate is not None:
+                    cand_path = out_dir / "subproblem_failed_candidate.txt"
+                    with cand_path.open("w", encoding="utf-8") as f:
+                        for k, v in sorted(candidate.items()):
+                            f.write(f"{k}={v}\n")
+                    print(f"[SP] Wrote candidate: {cand_path}")
+            except Exception:
+                pass
+            raise RuntimeError(f"Subproblem solve ambiguous: termination_condition={term}")
+    # Load solution only after optimal termination
+    try:
+        m.solutions.load_from(res)
+    except Exception:
+        pass
 
     alpha_OUT = {t: float(m.dual.get(m.D_out[t], 0.0)) for t in Tset}
     alpha_RET = {t: float(m.dual.get(m.D_ret[t], 0.0)) for t in Tset}
@@ -1040,6 +1095,28 @@ def solve_subproblem(P: SPParams, C_out: Iterable[float], C_ret: Iterable[float]
     penalty_cost = float(P.p) * penalty_pax
 
     obj_val = float(pyo.value(m.obj))
+    # Strong duality check
+    try:
+        cap_out_rhs = [min(float(P.S), float(C_out[tau])) for tau in Tset]
+        cap_ret_rhs = [min(float(P.S), float(C_ret[tau])) for tau in Tset]
+        dual_obj = sum(float(R_out[t]) * alpha_OUT[t] for t in Tset) + sum(float(R_ret[t]) * alpha_RET[t] for t in Tset)
+        dual_obj += sum(cap_out_rhs[tau] * pi_OUT[tau] for tau in Tset)
+        dual_obj += sum(cap_ret_rhs[tau] * pi_RET[tau] for tau in Tset)
+        eps_cut = float(getattr(P, "eps_cut", 1e-8)) if hasattr(P, "eps_cut") else 1e-8
+        if abs(float(obj_val) - float(dual_obj)) > eps_cut * max(1.0, abs(float(obj_val))):
+            raise RuntimeError(
+                f"Strong duality check failed: primal={obj_val} dual={dual_obj}"
+            )
+    except Exception as exc:
+        try:
+            out_dir = Path("Report")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            lp_path = out_dir / "subproblem_duality_failed.lp"
+            m.write(str(lp_path), io_options={"symbolic_solver_labels": True})
+            print(f"[SP] Wrote LP: {lp_path}")
+        except Exception:
+            pass
+        raise
     sum_components = wait_cost_slots + fill_eps_cost + penalty_cost
     if abs(sum_components - obj_val) > 1e-5:
         print(

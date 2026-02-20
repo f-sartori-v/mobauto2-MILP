@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 from datetime import datetime
+import re
 from pathlib import Path
 
 import pyomo.environ as pyo
@@ -9,6 +10,7 @@ import pyomo.environ as pyo
 from ..benders.master import MasterProblem
 from ..benders.solver import add_benders_cut  # shared cut filtering
 from ..benders.types import Candidate, Cut, SolveResult, SolveStatus
+from ..tolerances import project_binary_value
 
 
 class ProblemMaster(MasterProblem):
@@ -19,6 +21,9 @@ class ProblemMaster(MasterProblem):
         self._lb: Optional[float] = None
         # Fingerprints of cuts to avoid duplicates
         self._cut_fps: set[tuple] = set()
+        # Per-run cut signatures to avoid duplicates (reset in initialize)
+        self._cut_signatures: set[tuple] = set()
+        self._last_log_path: Optional[str] = None
         # Optional: warm start values for yOUT/yRET at next solve
         # Keys: ("yOUT"|"yRET", q:int, t:int) -> float(0/1)
         self._warm_start: dict[tuple[str, int, int], float] | None = None
@@ -46,7 +51,34 @@ class ProblemMaster(MasterProblem):
             pass
         return stats
 
+    def _parse_cplex_best_bound(self, log_path: str | None) -> tuple[Optional[float], Optional[float]]:
+        """Parse CPLEX log to extract best integer and best bound from the last node-table line."""
+        if not log_path:
+            return None, None
+        try:
+            p = Path(log_path)
+            if not p.exists():
+                return None, None
+            text = p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return None, None
+        best_int = None
+        best_bound = None
+        line_re = re.compile(
+            r"^\s*\*?\s*\d+\+?\s+\d+\s+([-\d\.eE\+]+)\s+\d+\s+([-\d\.eE\+]+)\s+([-\d\.eE\+]+)",
+            re.MULTILINE,
+        )
+        for m in line_re.finditer(text):
+            try:
+                best_int = float(m.group(2))
+                best_bound = float(m.group(3))
+            except Exception:
+                continue
+        return best_int, best_bound
+
     def initialize(self) -> None:
+        # Reset per-run cut signatures
+        self._cut_signatures = set()
         Q = int(self._p("Q"))
         # Time discretization: prefer minutes + slot_resolution + trip_duration_minutes
         import math
@@ -460,38 +492,42 @@ class ProblemMaster(MasterProblem):
                 self._warm_start = None
         # Use previous master solution as MIP start if enabled and no explicit warm start
         if (not use_ws) and bool(self._p("use_mip_start", False)) and self._last_solution:
+            eps_bin = float(self._p("eps_bin", 1e-6))
             try:
                 for name, val in self._last_solution.items():
+                    pv = project_binary_value(val, eps_bin)
+                    if pv is None:
+                        continue
                     if name.startswith("yOUT["):
                         inside = name[name.find("[") + 1 : name.find("]")]
                         q_str, t_str = inside.split(",")
                         q = int(q_str.strip())
                         t = int(t_str.strip())
-                        m.yOUT[q, t].value = float(val)
+                        m.yOUT[q, t].value = pv
                     elif name.startswith("yRET["):
                         inside = name[name.find("[") + 1 : name.find("]")]
                         q_str, t_str = inside.split(",")
                         q = int(q_str.strip())
                         t = int(t_str.strip())
-                        m.yRET[q, t].value = float(val)
+                        m.yRET[q, t].value = pv
                     elif name.startswith("atL["):
                         inside = name[name.find("[") + 1 : name.find("]")]
                         q_str, t_str = inside.split(",")
                         q = int(q_str.strip())
                         t = int(t_str.strip())
-                        m.atL[q, t].value = float(val)
+                        m.atL[q, t].value = pv
                     elif name.startswith("atM["):
                         inside = name[name.find("[") + 1 : name.find("]")]
                         q_str, t_str = inside.split(",")
                         q = int(q_str.strip())
                         t = int(t_str.strip())
-                        m.atM[q, t].value = float(val)
+                        m.atM[q, t].value = pv
                     elif name.startswith("inTrip["):
                         inside = name[name.find("[") + 1 : name.find("]")]
                         q_str, t_str = inside.split(",")
                         q = int(q_str.strip())
                         t = int(t_str.strip())
-                        m.inTrip[q, t].value = float(val)
+                        m.inTrip[q, t].value = pv
                 use_ws = True
             except Exception:
                 use_ws = False
@@ -515,8 +551,15 @@ class ProblemMaster(MasterProblem):
             backend = str(self._p("solver_backend", "")).lower()
             if backend in ("cplex", ""):
                 solver.options["logfile"] = str(log_path)
+            else:
+                # cplex_direct: set internal log file attribute if available
+                try:
+                    setattr(solver, "_log_file", str(log_path))
+                except Exception:
+                    pass
         except Exception:
             log_path = None
+        self._last_log_path = str(log_path) if log_path is not None else None
 
         res = solver.solve(
             m,
@@ -526,12 +569,49 @@ class ProblemMaster(MasterProblem):
             keepfiles=True,
             symbolic_solver_labels=True,
         )
+        # Try to capture the actual solver log path (including temp log from direct interfaces)
+        try:
+            for attr in ("logfile", "log_file", "_log_file", "_logfile", "log_path", "_log_path", "log", "logfile_name", "log_filename"):
+                val = getattr(res.solver, attr, None)
+                if isinstance(val, str) and val:
+                    self._last_log_path = val
+                    break
+        except Exception:
+            pass
+        term = getattr(res.solver, "termination_condition", None)
+        # Fallback: if file-based cplex returns UNKNOWN, retry with cplex_direct
+        try:
+            backend = str(self._p("solver_backend", "")).lower()
+        except Exception:
+            backend = ""
+        if term not in (pyo.TerminationCondition.optimal, pyo.TerminationCondition.feasible, pyo.TerminationCondition.maxTimeLimit) and backend in ("cplex", ""):
+            try:
+                fallback = pyo.SolverFactory("cplex_direct")
+                # Apply options compatible with cplex_direct
+                try:
+                    cplex_opts = self._p("cplex_options", {}) or {}
+                    for k, v in cplex_opts.items():
+                        if str(k).upper().startswith("CPXPARAM_"):
+                            continue
+                        fallback.options[k] = v
+                except Exception:
+                    pass
+                res = fallback.solve(
+                    m,
+                    tee=True,
+                    warmstart=use_ws,
+                    load_solutions=True,
+                    keepfiles=True,
+                    symbolic_solver_labels=True,
+                )
+                term = getattr(res.solver, "termination_condition", None)
+                print("[MP] Fallback to cplex_direct due to UNKNOWN termination.")
+            except Exception:
+                pass
         try:
             m.solutions.load_from(res)
         except Exception:
             pass
-
-        term = getattr(res.solver, "termination_condition", None)
         st = getattr(res.solver, "status", None)
         try:
             best_bound = getattr(res.solver, "best_bound", None)
@@ -541,10 +621,24 @@ class ProblemMaster(MasterProblem):
             incumbent = getattr(res.solver, "objective", None)
         except Exception:
             incumbent = None
+        parsed_best_int = None
+        parsed_best_bound = None
+        if best_bound is None:
+            parsed_best_int, parsed_best_bound = self._parse_cplex_best_bound(self._last_log_path)
+            if parsed_best_bound is not None:
+                best_bound = parsed_best_bound
         print(
             "MP raw solver: status=%s term=%s incumbent=%s best_bound=%s"
             % (str(st), str(term), str(incumbent), str(best_bound))
         )
+        if parsed_best_int is not None or parsed_best_bound is not None:
+            print(
+                "MP parsed bounds: best_integer=%s best_bound=%s"
+                % (
+                    (f"{float(parsed_best_int):.6g}" if parsed_best_int is not None else "-"),
+                    (f"{float(parsed_best_bound):.6g}" if parsed_best_bound is not None else "-"),
+                )
+            )
         try:
             sol_len = len(getattr(res, "solution", []))
             sol_keys = list(getattr(res, "solution", {}).keys()) if hasattr(res, "solution") else []
@@ -563,15 +657,6 @@ class ProblemMaster(MasterProblem):
         ):
             status = SolveStatus.INFEASIBLE
         else:
-            status = SolveStatus.UNKNOWN
-
-        # If no incumbent solution exists, treat as UNKNOWN and avoid using candidate
-        has_incumbent = False
-        try:
-            has_incumbent = bool(getattr(res, "solution", []))
-        except Exception:
-            has_incumbent = False
-        if not has_incumbent and status in (SolveStatus.FEASIBLE, SolveStatus.OPTIMAL):
             status = SolveStatus.UNKNOWN
 
         # Use full master objective as lower bound on total cost (first-stage + recourse proxy)
@@ -594,6 +679,12 @@ class ProblemMaster(MasterProblem):
             raise RuntimeError(
                 "Master solve did not load variable values. Check solver log/LP for details."
             ) from exc
+        # If we loaded variable values, treat as having an incumbent
+        if status in (SolveStatus.FEASIBLE, SolveStatus.OPTIMAL):
+            pass
+        else:
+            # Keep UNKNOWN/INFEASIBLE as-is
+            pass
 
         # Sanity: if we have any cuts, at least one y should be nonzero
         try:
@@ -611,6 +702,13 @@ class ProblemMaster(MasterProblem):
         except Exception:
             pass
         self._last_solve_stats = self._extract_solver_stats(res)
+        if parsed_best_bound is not None:
+            try:
+                self._last_solve_stats["best_bound"] = float(parsed_best_bound)
+                if parsed_best_int is not None:
+                    self._last_solve_stats["best_integer"] = float(parsed_best_int)
+            except Exception:
+                pass
         # Print per-shuttle total departures to confirm symmetry constraints are active
         try:
             totals = []
@@ -652,20 +750,42 @@ class ProblemMaster(MasterProblem):
     def last_solve_stats(self) -> dict[str, Any]:
         return dict(getattr(self, "_last_solve_stats", {}) or {})
 
+    def last_solver_log_path(self) -> Optional[str]:
+        return self._last_log_path
+
     def _collect_candidate(self) -> Candidate:
         assert self.m is not None
         m = self.m
         cand: Candidate = {}
+        eps_bin = float(self._p("eps_bin", 1e-6))
+        offenders: list[tuple[str, float]] = []
         for q in m.Q:
             for t in m.T:
                 try:
-                    cand[f"yOUT[{int(q)},{int(t)}]"] = float(m.yOUT[q, t].value or 0.0)
+                    v_out = float(m.yOUT[q, t].value or 0.0)
                 except Exception:
-                    cand[f"yOUT[{int(q)},{int(t)}]"] = 0.0
+                    v_out = 0.0
                 try:
-                    cand[f"yRET[{int(q)},{int(t)}]"] = float(m.yRET[q, t].value or 0.0)
+                    v_ret = float(m.yRET[q, t].value or 0.0)
                 except Exception:
-                    cand[f"yRET[{int(q)},{int(t)}]"] = 0.0
+                    v_ret = 0.0
+                pv_out = project_binary_value(v_out, eps_bin)
+                pv_ret = project_binary_value(v_ret, eps_bin)
+                if pv_out is None:
+                    offenders.append((f"yOUT[{int(q)},{int(t)}]", v_out))
+                else:
+                    cand[f"yOUT[{int(q)},{int(t)}]"] = pv_out
+                if pv_ret is None:
+                    offenders.append((f"yRET[{int(q)},{int(t)}]", v_ret))
+                else:
+                    cand[f"yRET[{int(q)},{int(t)}]"] = pv_ret
+        if offenders:
+            offenders.sort(key=lambda kv: abs(kv[1] - 0.5), reverse=True)
+            top = offenders[:5]
+            raise RuntimeError(
+                "Non-binary master solution; refusing SP evaluation. Offenders: "
+                + ", ".join(f"{k}={v:.6g}" for k, v in top)
+            )
         return cand
 
     # Pretty-print the current master solution (if solved)
@@ -947,6 +1067,19 @@ class ProblemMaster(MasterProblem):
             rhs_out_val = float(rhs_out_val)
             lhs_ret_val = float(lhs_ret_val)
             rhs_ret_val = float(rhs_ret_val)
+            # Tightness + violation checks
+            eps_cut = float(self._p("eps_cut", 1e-8))
+            if ub_est_out is not None and abs(rhs_out_val - float(ub_est_out)) > eps_cut * max(1.0, abs(float(ub_est_out))):
+                print("[CUT DEBUG] Tightness failed (OUT). ub=%.6g rhs=%.6g" % (float(ub_est_out), rhs_out_val))
+                return False
+            if ub_est_ret is not None and abs(rhs_ret_val - float(ub_est_ret)) > eps_cut * max(1.0, abs(float(ub_est_ret))):
+                print("[CUT DEBUG] Tightness failed (RET). ub=%.6g rhs=%.6g" % (float(ub_est_ret), rhs_ret_val))
+                return False
+            viol_out = rhs_out_val - lhs_out_val
+            viol_ret = rhs_ret_val - lhs_ret_val
+            if (viol_out <= eps_cut * max(1.0, abs(rhs_out_val))) and (viol_ret <= eps_cut * max(1.0, abs(rhs_ret_val))):
+                print("[CUT DEBUG] Not violated (dir). viol_out=%.6g viol_ret=%.6g" % (viol_out, viol_ret))
+                return False
             if aggregate:
                 slopes_out = {("Yout", int(t)): float(v) for t, v in agg_out.items()}
                 slopes_ret = {("Yret", int(t)): float(v) for t, v in agg_ret.items()}
@@ -964,6 +1097,8 @@ class ProblemMaster(MasterProblem):
                     rhs_value=rhs_out_val,
                     cut_type="optimality:out",
                     signature_scope=("dir:out", scen_idx),
+                    cuts_in_model=self._cut_idx,
+                    signature_set=self._cut_signatures,
                 )
                 added_ret = add_benders_cut(
                     iteration=-1,
@@ -973,6 +1108,8 @@ class ProblemMaster(MasterProblem):
                     rhs_value=rhs_ret_val,
                     cut_type="optimality:ret",
                     signature_scope=("dir:ret", scen_idx),
+                    cuts_in_model=self._cut_idx,
+                    signature_set=self._cut_signatures,
                 )
                 if not (added_out or added_ret):
                     return False
@@ -989,6 +1126,15 @@ class ProblemMaster(MasterProblem):
                 return False
             lhs_val = float(lhs_val)
             rhs_val = float(rhs_val)
+            # Tightness + violation checks
+            eps_cut = float(self._p("eps_cut", 1e-8))
+            if abs(rhs_val - float(ub_est)) > eps_cut * max(1.0, abs(float(ub_est))):
+                print("[CUT DEBUG] Tightness failed. ub=%.6g rhs=%.6g" % (float(ub_est), rhs_val))
+                return False
+            viol = rhs_val - lhs_val
+            if viol <= eps_cut * max(1.0, abs(rhs_val)):
+                print("[CUT DEBUG] Not violated. viol=%.6g" % (viol,))
+                return False
             if aggregate:
                 slopes_all = {("Yout", int(t)): float(v) for t, v in agg_out.items()}
                 slopes_all.update({("Yret", int(t)): float(v) for t, v in agg_ret.items()})
@@ -1006,6 +1152,8 @@ class ProblemMaster(MasterProblem):
                     rhs_value=rhs_val,
                     cut_type=str(cut.cut_type).lower() if hasattr(cut, "cut_type") else "optimality",
                     signature_scope=("scen", scen_idx),
+                    cuts_in_model=self._cut_idx,
+                    signature_set=self._cut_signatures,
                 )
                 if not ok:
                     return False

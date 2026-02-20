@@ -132,6 +132,15 @@ class RootConfig:
     master: MasterSection
     subproblem: SubproblemSection
     solver: SolverSection
+    tolerances: "TolerancesSection"
+
+
+@dataclass(slots=True)
+class TolerancesSection:
+    eps_bin: float = 1e-6
+    eps_feas: float = 1e-7
+    eps_cut: float = 1e-8
+    eps_hash: float = 1e-6
 
 
 # ---- Expression evaluation (energy params only) ----
@@ -444,7 +453,7 @@ def _parse_v2(raw: Mapping[str, Any]) -> RootConfig:
     data = _as_mapping(raw, "config")
     _check_unknown_keys(
         data,
-        {"schema", "run", "data", "model", "master", "subproblem", "solver"},
+        {"schema", "run", "data", "model", "master", "subproblem", "solver", "tolerances"},
         "config",
     )
     _require_keys(data, {"schema", "run", "data", "model", "master", "subproblem", "solver"}, "config")
@@ -745,6 +754,15 @@ def _parse_v2(raw: Mapping[str, Any]) -> RootConfig:
     if solver_section.master_solver.lower() == "cplex_persistent":
         raise ValueError("persistent solver mode removed; use solver.master_solver=cplex")
 
+    tol_raw = _as_mapping(data.get("tolerances", {}), "tolerances")
+    _check_unknown_keys(tol_raw, {"eps_bin", "eps_feas", "eps_cut", "eps_hash"}, "tolerances")
+    tol_section = TolerancesSection(
+        eps_bin=_ensure_float(_disallow_expr(tol_raw.get("eps_bin", 1e-6), "tolerances.eps_bin"), "tolerances.eps_bin"),
+        eps_feas=_ensure_float(_disallow_expr(tol_raw.get("eps_feas", 1e-7), "tolerances.eps_feas"), "tolerances.eps_feas"),
+        eps_cut=_ensure_float(_disallow_expr(tol_raw.get("eps_cut", 1e-8), "tolerances.eps_cut"), "tolerances.eps_cut"),
+        eps_hash=_ensure_float(_disallow_expr(tol_raw.get("eps_hash", 1e-6), "tolerances.eps_hash"), "tolerances.eps_hash"),
+    )
+
     model_section = ModelSection(
         time=time_section,
         fleet=fleet_section,
@@ -760,6 +778,7 @@ def _parse_v2(raw: Mapping[str, Any]) -> RootConfig:
         master=master_section,
         subproblem=sub_section,
         solver=solver_section,
+        tolerances=tol_section,
     )
 
 
@@ -791,6 +810,7 @@ __all__ = [
     "SubproblemSection",
     "SolverSection",
     "RootConfig",
+    "TolerancesSection",
     "DEFAULT_CONFIG_PATH",
     "load_config",
     "resolve_energy_params",
