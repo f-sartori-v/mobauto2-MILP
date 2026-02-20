@@ -395,101 +395,47 @@ class ProblemMaster(MasterProblem):
                     solver.options[k] = v
         except Exception:
             pass
-        # Apply warm start if provided: set initial y values and aggregated Yout/Yret
+        # Apply warm start if provided: set initial y values only (x-only start)
         use_ws = False
         if self._warm_start:
             try:
                 # Set binary starts only where provided; others left unset (partial MIP start)
-                yout_sums: dict[int, float] = {}
-                yret_sums: dict[int, float] = {}
-                # Keep per-(q,t) copies for derived warm-start values
-                _yout_qt: dict[tuple[int, int], float] = {}
-                _yret_qt: dict[tuple[int, int], float] = {}
+                eps_bin = float(self._p("eps_bin", 1e-6))
+                n_out = 0
+                n_ret = 0
+                # Clear existing y values to avoid stale carry-over for partial starts
+                try:
+                    for q in m.Q:
+                        for t in m.T:
+                            m.yOUT[q, t].value = None
+                            m.yRET[q, t].value = None
+                except Exception:
+                    pass
                 for (typ, q, t), v in self._warm_start.items():
-                    vv = float(v)
+                    try:
+                        vv = float(v)
+                    except Exception:
+                        continue
+                    pv = project_binary_value(vv, eps_bin)
+                    if pv is None:
+                        continue
                     if typ == "yOUT" and (q in m.Q) and (t in m.T):
                         try:
-                            m.yOUT[q, t].value = vv
-                            yout_sums[t] = yout_sums.get(t, 0.0) + vv
-                            _yout_qt[(int(q), int(t))] = vv
+                            m.yOUT[q, t].value = pv
+                            n_out += 1
                         except Exception:
                             pass
                     elif typ == "yRET" and (q in m.Q) and (t in m.T):
                         try:
-                            m.yRET[q, t].value = vv
-                            yret_sums[t] = yret_sums.get(t, 0.0) + vv
-                            _yret_qt[(int(q), int(t))] = vv
+                            m.yRET[q, t].value = pv
+                            n_ret += 1
                         except Exception:
                             pass
-                # Initialize aggregations for completeness (not required, but helpful for starts)
-                for t in m.T:
-                    try:
-                        if hasattr(m, "Yout"):
-                            m.Yout[t].value = float(yout_sums.get(int(t), 0.0))
-                        if hasattr(m, "Yret"):
-                            m.Yret[t].value = float(yret_sums.get(int(t), 0.0))
-                        if hasattr(m, "Z"):
-                            m.Z[t].value = float(yout_sums.get(int(t), 0.0) + yret_sums.get(int(t), 0.0))
-                        # Excess variables if present
-                        if hasattr(m, "eOut"):
-                            m.eOut[t].value = max(0.0, float(yout_sums.get(int(t), 0.0)) - 1.0)
-                        if hasattr(m, "eRet"):
-                            m.eRet[t].value = max(0.0, float(yret_sums.get(int(t), 0.0)) - 1.0)
-                    except Exception:
-                        pass
-                # Derive occupancy and inTrip consistent with y if available; this can help MIP start acceptance
-                try:
-                    import math as _math
-                    slot_res = int(self._p("slot_resolution", 1))
-                    trip_dur_min = self._p("trip_duration_minutes", self._p("trip_duration"))
-                    if trip_dur_min is not None:
-                        trip_slots = int(_math.ceil(float(trip_dur_min) / max(1, slot_res)))
-                    else:
-                        trip_slots = int(self._p("trip_slots", 0))
-                except Exception:
-                    trip_slots = 0
-                if trip_slots > 0:
-                    for q in m.Q:
-                        # Initial occupancy
-                        try:
-                            m.atL[q, 0].value = 1.0
-                            m.atM[q, 0].value = 0.0
-                            m.inTrip[q, 0].value = 0.0
-                        except Exception:
-                            pass
-                        # inTrip[q,t] per definition: sum of starts in previous (trip_slots-1) slots
-                        for t in m.T:
-                            t = int(t)
-                            if t == 0:
-                                continue
-                            lo = max(0, t - trip_slots + 1)
-                            hi = t - 1
-                            s = 0.0
-                            for u in range(lo, hi + 1):
-                                s += float(_yout_qt.get((int(q), int(u)), 0.0))
-                                s += float(_yret_qt.get((int(q), int(u)), 0.0))
-                            try:
-                                m.inTrip[q, t].value = s
-                            except Exception:
-                                pass
-                        # Occupancy recursions
-                        for t in m.T:
-                            t = int(t)
-                            if t == 0:
-                                continue
-                            arr_ret = float(_yret_qt.get((int(q), t - trip_slots), 0.0)) if (t - trip_slots) >= 0 else 0.0
-                            arr_out = float(_yout_qt.get((int(q), t - trip_slots), 0.0)) if (t - trip_slots) >= 0 else 0.0
-                            try:
-                                prevL = float(m.atL[q, t - 1].value or 0.0)
-                                prevM = float(m.atM[q, t - 1].value or 0.0)
-                            except Exception:
-                                prevL = prevM = 0.0
-                            try:
-                                m.atL[q, t].value = prevL - float(_yout_qt.get((int(q), t - 1), 0.0)) + arr_ret
-                                m.atM[q, t].value = prevM - float(_yret_qt.get((int(q), t - 1), 0.0)) + arr_out
-                            except Exception:
-                                pass
-                use_ws = True
+                if n_out + n_ret > 0:
+                    print(f"[MIPSTART] x-only start applied: n_out={n_out} n_ret={n_ret}")
+                    use_ws = True
+                else:
+                    print("[MIPSTART] no x vars found; skipping warm start")
             except Exception:
                 use_ws = False
             finally:
@@ -499,8 +445,14 @@ class ProblemMaster(MasterProblem):
         if (not use_ws) and bool(self._p("use_mip_start", False)) and self._last_solution:
             eps_bin = float(self._p("eps_bin", 1e-6))
             try:
+                n_out = 0
+                n_ret = 0
                 for name, val in self._last_solution.items():
-                    pv = project_binary_value(val, eps_bin)
+                    try:
+                        vv = float(val)
+                    except Exception:
+                        continue
+                    pv = project_binary_value(vv, eps_bin)
                     if pv is None:
                         continue
                     if name.startswith("yOUT["):
@@ -508,32 +460,22 @@ class ProblemMaster(MasterProblem):
                         q_str, t_str = inside.split(",")
                         q = int(q_str.strip())
                         t = int(t_str.strip())
-                        m.yOUT[q, t].value = pv
+                        if (q in m.Q) and (t in m.T):
+                            m.yOUT[q, t].value = pv
+                            n_out += 1
                     elif name.startswith("yRET["):
                         inside = name[name.find("[") + 1 : name.find("]")]
                         q_str, t_str = inside.split(",")
                         q = int(q_str.strip())
                         t = int(t_str.strip())
-                        m.yRET[q, t].value = pv
-                    elif name.startswith("atL["):
-                        inside = name[name.find("[") + 1 : name.find("]")]
-                        q_str, t_str = inside.split(",")
-                        q = int(q_str.strip())
-                        t = int(t_str.strip())
-                        m.atL[q, t].value = pv
-                    elif name.startswith("atM["):
-                        inside = name[name.find("[") + 1 : name.find("]")]
-                        q_str, t_str = inside.split(",")
-                        q = int(q_str.strip())
-                        t = int(t_str.strip())
-                        m.atM[q, t].value = pv
-                    elif name.startswith("inTrip["):
-                        inside = name[name.find("[") + 1 : name.find("]")]
-                        q_str, t_str = inside.split(",")
-                        q = int(q_str.strip())
-                        t = int(t_str.strip())
-                        m.inTrip[q, t].value = pv
-                use_ws = True
+                        if (q in m.Q) and (t in m.T):
+                            m.yRET[q, t].value = pv
+                            n_ret += 1
+                if n_out + n_ret > 0:
+                    print(f"[MIPSTART] x-only start applied: n_out={n_out} n_ret={n_ret}")
+                    use_ws = True
+                else:
+                    print("[MIPSTART] no x vars found; skipping warm start")
             except Exception:
                 use_ws = False
         # Diagnostics: write LP and enable solver logs

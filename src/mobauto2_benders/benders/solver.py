@@ -230,6 +230,9 @@ class BendersSolver:
         self.master = master
         self.subproblem = subproblem
         self.cfg = cfg
+        # MW core point state (aggregate space)
+        self._mw_core_out = None
+        self._mw_core_ret = None
 
     def run(self) -> BendersRunResult:
         t0 = time.time()
@@ -255,6 +258,15 @@ class BendersSolver:
         quick_mp_gap = 0.05
         deep_mp_time = 20.0
         deep_mp_gap = 0.01
+        # MW config (default enabled)
+        mw_enabled = bool(getattr(self.cfg.solver, "mw_enabled", True))
+        mw_alpha = float(getattr(self.cfg.solver, "mw_core_alpha", 0.10) or 0.10)
+        mw_eps = float(getattr(self.cfg.solver, "mw_core_eps", 1e-3) or 1e-3)
+        if not (0.0 < mw_alpha <= 1.0):
+            mw_alpha = 0.10
+        if mw_eps <= 0.0:
+            mw_eps = 1e-3
+        print(f"[MW] enabled={mw_enabled} alpha={mw_alpha:.3g} eps={mw_eps:.3g}")
 
         def _calc_pax_totals_from_diag(diag: dict | None) -> tuple[Optional[float], Optional[float]]:
             if not isinstance(diag, dict):
@@ -847,32 +859,100 @@ class BendersSolver:
                 continue
 
             # Optional: update and pass a core point for Magnanti–Wong selection
-            try:
-                mw_enabled = bool(self.cfg.subproblem.use_magnanti_wong)
-            except Exception:
-                mw_enabled = False
             if mw_enabled:
-                # Lazy-init the core point helper with configured alpha
+                # Determine Q and T safely
+                Qn = None
+                Tn = None
                 try:
-                    alpha = float(self.cfg.subproblem.mw_core_alpha or 0.3)
-                except Exception:
-                    alpha = 0.3
-                if not hasattr(self, "_core_point") or self._core_point is None:
-                    self._core_point = CorePoint(alpha=alpha)
-                # Update core from current incumbent (moving average)
-                try:
-                    # Provide a hint for T from last diagnostics if available
-                    T_hint = None
-                    if last_diag and isinstance(last_diag, dict) and "T" in last_diag:
+                    m = getattr(self.master, "m", None)
+                    if m is not None:
                         try:
-                            T_hint = int(last_diag.get("T"))
+                            Qn = len(list(m.Q))
                         except Exception:
-                            T_hint = None
-                    self._core_point.update_from_candidate(mres.candidate, T_hint=T_hint)
-                    # Attach to subproblem params for MW dual selection
+                            Qn = None
+                        try:
+                            Tn = len(list(m.T))
+                        except Exception:
+                            Tn = None
+                except Exception:
+                    pass
+                if Qn is None:
+                    try:
+                        Qn = int(getattr(self.master, "params", {}).get("Q"))
+                    except Exception:
+                        Qn = None
+                if Tn is None:
+                    try:
+                        Tn = int(getattr(self.master, "params", {}).get("T"))
+                    except Exception:
+                        Tn = None
+
+                # Initialize neutral interior core if missing
+                if self._mw_core_out is None or self._mw_core_ret is None:
+                    if Qn is not None and Tn is not None:
+                        eps = float(mw_eps)
+                        cap = float(Qn) - eps
+                        seed = min(max(float(Qn) / 2.0, eps), cap)
+                        self._mw_core_out = [seed for _ in range(Tn)]
+                        self._mw_core_ret = [seed for _ in range(Tn)]
+
+                # Update core from current incumbent (moving average)
+                if mres.candidate and Qn is not None and Tn is not None:
+                    cur_out = [0.0 for _ in range(Tn)]
+                    cur_ret = [0.0 for _ in range(Tn)]
+                    for name, val in mres.candidate.items():
+                        if not isinstance(name, str):
+                            continue
+                        try:
+                            if name.startswith("yOUT["):
+                                inside = name[name.find("[") + 1 : name.find("]")]
+                                _, t_str = inside.split(",")
+                                t = int(t_str.strip())
+                                if 0 <= t < Tn:
+                                    cur_out[t] += float(val)
+                            elif name.startswith("yRET["):
+                                inside = name[name.find("[") + 1 : name.find("]")]
+                                _, t_str = inside.split(",")
+                                t = int(t_str.strip())
+                                if 0 <= t < Tn:
+                                    cur_ret[t] += float(val)
+                        except Exception:
+                            continue
+                    if self._mw_core_out is None or self._mw_core_ret is None:
+                        self._mw_core_out = list(cur_out)
+                        self._mw_core_ret = list(cur_ret)
+                    else:
+                        for t in range(Tn):
+                            self._mw_core_out[t] = (1.0 - mw_alpha) * float(self._mw_core_out[t]) + mw_alpha * float(cur_out[t])
+                            self._mw_core_ret[t] = (1.0 - mw_alpha) * float(self._mw_core_ret[t]) + mw_alpha * float(cur_ret[t])
+                    # Keep strictly interior
+                    eps = float(mw_eps)
+                    cap = float(Qn) - eps
+                    for t in range(Tn):
+                        self._mw_core_out[t] = min(max(float(self._mw_core_out[t]), eps), cap)
+                        self._mw_core_ret[t] = min(max(float(self._mw_core_ret[t]), eps), cap)
+                    try:
+                        vals = list(self._mw_core_out or []) + list(self._mw_core_ret or [])
+                        if vals:
+                            vmin = min(vals)
+                            vmax = max(vals)
+                            vmean = sum(vals) / float(len(vals))
+                            print(f"[MW] core updated (t=0..): min={vmin:.3g} max={vmax:.3g} mean={vmean:.3g}")
+                    except Exception:
+                        pass
+
+                # Attach to subproblem params for MW dual selection
+                try:
                     if isinstance(getattr(self.subproblem, "params", None), dict):
-                        self.subproblem.params["mw_core_point"] = self._core_point.as_params()
-                        self.subproblem.params["use_magnanti_wong"] = True
+                        if self._mw_core_out is not None and self._mw_core_ret is not None:
+                            self.subproblem.params["mw_core_point"] = {"Yout": list(self._mw_core_out), "Yret": list(self._mw_core_ret)}
+                        self.subproblem.params["use_magnanti_wong"] = mw_enabled
+                except Exception:
+                    pass
+            else:
+                try:
+                    if isinstance(getattr(self.subproblem, "params", None), dict):
+                        self.subproblem.params["use_magnanti_wong"] = mw_enabled
                 except Exception:
                     pass
 
