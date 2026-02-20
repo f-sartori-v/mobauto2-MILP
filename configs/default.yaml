@@ -27,14 +27,14 @@ data:
 model:
   time:
     # Total horizon length in minutes (T_minutes) or discrete slots (T)
-    T_minutes: 810
+    T_minutes: 660
     # Minutes per slot
     slot_resolution: 30
     # Trip duration in minutes (converted internally to slots)
     trip_duration_minutes: 30
   fleet:
     # Number of shuttles
-    Q: 2
+    Q: 3
     # Initial battery per shuttle (length Q)
     binit: [150.0, 150.0, 150.0, 150.0, 150.0, 150.0, 150.0]
   energy:
@@ -100,7 +100,7 @@ solver:
   # Benders loop settings
   max_iterations: 100
   tolerance: 0.001
-  time_limit_s: 600
+  time_limit_s: 300
   # Optional stall-based early stopping
   stall_max_no_improve_iters: 0
   stall_min_abs_improve: 1.0

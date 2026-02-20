@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Optional
 from datetime import datetime
-import re
 from pathlib import Path
 
 import pyomo.environ as pyo
@@ -10,6 +9,7 @@ import pyomo.environ as pyo
 from ..benders.master import MasterProblem
 from ..benders.solver import add_benders_cut  # shared cut filtering
 from ..benders.types import Candidate, Cut, SolveResult, SolveStatus
+from ..benders.cplex_log import parse_cplex_log_bounds
 from ..tolerances import project_binary_value
 
 
@@ -51,30 +51,35 @@ class ProblemMaster(MasterProblem):
             pass
         return stats
 
-    def _parse_cplex_best_bound(self, log_path: str | None) -> tuple[Optional[float], Optional[float]]:
-        """Parse CPLEX log to extract best integer and best bound from the last node-table line."""
-        if not log_path:
-            return None, None
+    def _parse_cplex_log_bounds(self, log_path: str | None) -> dict[str, Optional[float] | str]:
+        return parse_cplex_log_bounds(log_path)
+
+    def _extract_cplex_api_stats(self, solver) -> dict[str, Any]:
+        """Extract MIP stats directly from CPLEX Python API when available."""
+        stats: dict[str, Any] = {}
         try:
-            p = Path(log_path)
-            if not p.exists():
-                return None, None
-            text = p.read_text(encoding="utf-8", errors="ignore")
+            cpx = getattr(solver, "_solver_model", None)
         except Exception:
-            return None, None
-        best_int = None
-        best_bound = None
-        line_re = re.compile(
-            r"^\s*\*?\s*\d+\+?\s+\d+\s+([-\d\.eE\+]+)\s+\d+\s+([-\d\.eE\+]+)\s+([-\d\.eE\+]+)",
-            re.MULTILINE,
-        )
-        for m in line_re.finditer(text):
-            try:
-                best_int = float(m.group(2))
-                best_bound = float(m.group(3))
-            except Exception:
-                continue
-        return best_int, best_bound
+            cpx = None
+        if cpx is None:
+            return stats
+        try:
+            if cpx.solution.is_primal_feasible():
+                stats["incumbent"] = cpx.solution.get_objective_value()
+        except Exception:
+            pass
+        try:
+            if hasattr(cpx.solution, "MIP"):
+                stats["best_bound"] = cpx.solution.MIP.get_best_objective()
+                stats["gap"] = cpx.solution.MIP.get_mip_relative_gap()
+        except Exception:
+            pass
+        try:
+            if hasattr(cpx.solution, "progress"):
+                stats["nodes"] = cpx.solution.progress.get_num_nodes_processed()
+        except Exception:
+            pass
+        return stats
 
     def initialize(self) -> None:
         # Reset per-run cut signatures
@@ -536,7 +541,15 @@ class ProblemMaster(MasterProblem):
             out_dir = Path(self._p("lp_output_dir", "Report"))
             out_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            lp_path = out_dir / f"master_iter_{self._cut_idx}_{ts}.lp"
+            try:
+                it = int(self._p("iteration", -1))
+            except Exception:
+                it = -1
+            cuts = int(self._cut_idx)
+            if it >= 0:
+                lp_path = out_dir / f"master_iter_{it:03d}_cuts_{cuts:03d}_{ts}.lp"
+            else:
+                lp_path = out_dir / f"master_iter_cuts_{cuts:03d}_{ts}.lp"
             m.write(str(lp_path), io_options={"symbolic_solver_labels": True})
             print(f"[MP] Wrote LP: {lp_path}")
         except Exception:
@@ -547,7 +560,15 @@ class ProblemMaster(MasterProblem):
             out_dir = Path(self._p("lp_output_dir", "Report"))
             out_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            log_path = out_dir / f"master_iter_{self._cut_idx}_{ts}.log"
+            try:
+                it = int(self._p("iteration", -1))
+            except Exception:
+                it = -1
+            cuts = int(self._cut_idx)
+            if it >= 0:
+                log_path = out_dir / f"master_iter_{it:03d}_cuts_{cuts:03d}_{ts}.log"
+            else:
+                log_path = out_dir / f"master_iter_cuts_{cuts:03d}_{ts}.log"
             backend = str(self._p("solver_backend", "")).lower()
             if backend in ("cplex", ""):
                 solver.options["logfile"] = str(log_path)
@@ -613,23 +634,74 @@ class ProblemMaster(MasterProblem):
         except Exception:
             pass
         st = getattr(res.solver, "status", None)
-        try:
-            best_bound = getattr(res.solver, "best_bound", None)
-        except Exception:
-            best_bound = None
-        try:
-            incumbent = getattr(res.solver, "objective", None)
-        except Exception:
-            incumbent = None
-        parsed_best_int = None
-        parsed_best_bound = None
-        if best_bound is None:
-            parsed_best_int, parsed_best_bound = self._parse_cplex_best_bound(self._last_log_path)
-            if parsed_best_bound is not None:
-                best_bound = parsed_best_bound
+
+        stats = self._extract_solver_stats(res)
+        sources: dict[str, str] = {}
+        if stats.get("incumbent") is not None:
+            sources["incumbent"] = "solver_results"
+        if stats.get("best_bound") is not None:
+            sources["best_bound"] = "solver_results"
+        if stats.get("gap") is not None:
+            sources["gap"] = "solver_results"
+
+        api_stats = self._extract_cplex_api_stats(solver)
+        for k in ("incumbent", "best_bound", "gap", "nodes"):
+            if stats.get(k) is None and api_stats.get(k) is not None:
+                stats[k] = api_stats[k]
+                sources[k] = "cplex_api"
+
+        parsed = self._parse_cplex_log_bounds(self._last_log_path)
+        parsed_best_int = parsed.get("best_integer")
+        parsed_best_bound = parsed.get("best_bound")
+        parsed_gap = parsed.get("gap")
+        parsed_source = parsed.get("source")
+
+        if stats.get("incumbent") is None and parsed_best_int is not None:
+            stats["incumbent"] = parsed_best_int
+            sources["incumbent"] = f"cplex_log:{parsed_source}" if parsed_source else "cplex_log"
+        if stats.get("best_bound") is None and parsed_best_bound is not None:
+            stats["best_bound"] = parsed_best_bound
+            sources["best_bound"] = f"cplex_log:{parsed_source}" if parsed_source else "cplex_log"
+        if stats.get("gap") is None and parsed_gap is not None:
+            stats["gap"] = parsed_gap
+            sources["gap"] = f"cplex_log:{parsed_source}" if parsed_source else "cplex_log"
+
+        if stats.get("gap") is None and stats.get("incumbent") is not None and stats.get("best_bound") is not None:
+            try:
+                inc = float(stats["incumbent"])
+                bb = float(stats["best_bound"])
+                gap_val = (inc - bb) / max(1.0, abs(inc))
+                if gap_val < 0.0:
+                    gap_val = 0.0
+                stats["gap"] = gap_val
+                sources["gap"] = "computed"
+            except Exception:
+                pass
+
+        if stats.get("best_integer") is None:
+            if stats.get("incumbent") is not None:
+                stats["best_integer"] = stats.get("incumbent")
+            elif parsed_best_int is not None:
+                stats["best_integer"] = parsed_best_int
+
+        stats["incumbent_source"] = sources.get("incumbent")
+        stats["best_bound_source"] = sources.get("best_bound")
+        stats["gap_source"] = sources.get("gap")
+
+        if stats.get("best_bound") is None:
+            if self._last_log_path is None:
+                stats["best_bound_reason"] = "no_log_path"
+            else:
+                stats["best_bound_reason"] = "not_in_solver_or_log"
+
         print(
             "MP raw solver: status=%s term=%s incumbent=%s best_bound=%s"
-            % (str(st), str(term), str(incumbent), str(best_bound))
+            % (
+                str(st),
+                str(term),
+                str(stats.get("incumbent")),
+                str(stats.get("best_bound")),
+            )
         )
         if parsed_best_int is not None or parsed_best_bound is not None:
             print(
@@ -659,6 +731,14 @@ class ProblemMaster(MasterProblem):
         else:
             status = SolveStatus.UNKNOWN
 
+        if status == SolveStatus.OPTIMAL:
+            try:
+                gap_val = stats.get("gap")
+                if gap_val is not None and float(gap_val) > 1e-6:
+                    status = SolveStatus.FEASIBLE
+            except Exception:
+                pass
+
         # Use full master objective as lower bound on total cost (first-stage + recourse proxy)
         val_obj = pyo.value(m.obj, exception=False)
         if val_obj is None:
@@ -666,7 +746,13 @@ class ProblemMaster(MasterProblem):
             self._lb = None
         else:
             objective = float(val_obj)
-            self._lb = objective
+            if stats.get("best_bound") is not None:
+                try:
+                    self._lb = float(stats.get("best_bound"))
+                except Exception:
+                    self._lb = objective
+            else:
+                self._lb = objective
 
         # Assert representative variable has a value
         try:
@@ -701,14 +787,7 @@ class ProblemMaster(MasterProblem):
                     print("[WARN] Master has cuts but all y are zero.")
         except Exception:
             pass
-        self._last_solve_stats = self._extract_solver_stats(res)
-        if parsed_best_bound is not None:
-            try:
-                self._last_solve_stats["best_bound"] = float(parsed_best_bound)
-                if parsed_best_int is not None:
-                    self._last_solve_stats["best_integer"] = float(parsed_best_int)
-            except Exception:
-                pass
+        self._last_solve_stats = stats
         # Print per-shuttle total departures to confirm symmetry constraints are active
         try:
             totals = []

@@ -5,14 +5,14 @@ import time
 import math
 from dataclasses import dataclass
 from typing import Optional, Iterable, Mapping, Any
-import re
-from pathlib import Path
 
 from ..config import RootConfig
 from .core import CorePoint
 from .master import MasterProblem
 from .subproblem import Subproblem
 from .types import SolveStatus, SubproblemResult
+from .cplex_log import parse_cplex_log_bounds
+import pyomo.environ as pyo
 
 log = logging.getLogger(__name__)
 
@@ -239,34 +239,6 @@ class BendersSolver:
         self.master.initialize()
         print("Initialized master problem.")
 
-        def _parse_cplex_best_bound(log_path: str | None) -> tuple[Optional[float], Optional[float]]:
-            if not log_path:
-                return None, None
-            try:
-                p = Path(log_path)
-                if not p.exists():
-                    return None, None
-                text = p.read_text(encoding="utf-8", errors="ignore")
-            except Exception:
-                return None, None
-            # Parse the last node table line with best integer/best bound.
-            # Format:
-            # Node Left Objective IInf Best Integer Best Bound ItCnt Gap
-            # We take the last occurrence.
-            best_int = None
-            best_bound = None
-            line_re = re.compile(
-                r"^\s*\*?\s*\d+\+?\s+\d+\s+([-\d\.eE\+]+)\s+\d+\s+([-\d\.eE\+]+)\s+([-\d\.eE\+]+)",
-                re.MULTILINE,
-            )
-            for m in line_re.finditer(text):
-                try:
-                    best_int = float(m.group(2))
-                    best_bound = float(m.group(3))
-                except Exception:
-                    continue
-            return best_int, best_bound
-
         total_master_time = 0.0
         total_sp_solve_time = 0.0
         total_cutgen_time = 0.0
@@ -275,6 +247,14 @@ class BendersSolver:
 
         last_pax_served: Optional[float] = None
         last_pax_total: Optional[float] = None
+        no_cut_streak = 0
+        last_mp_gap: Optional[float] = None
+        last_mp_term: Optional[str] = None
+        deep_mp_every = 5
+        quick_mp_time = 2.0
+        quick_mp_gap = 0.05
+        deep_mp_time = 20.0
+        deep_mp_gap = 0.01
 
         def _calc_pax_totals_from_diag(diag: dict | None) -> tuple[Optional[float], Optional[float]]:
             if not isinstance(diag, dict):
@@ -584,33 +564,46 @@ class BendersSolver:
 
             print(f"\n=== Iteration {it} ===")
             print("Solving Master (MP)...")
-            # Dynamic master solve schedule based on current relative gap (if available)
             try:
-                rel_gap_sched = None
-                if best_lb is not None and best_ub is not None:
-                    _gap = float(best_ub) - float(best_lb)
-                    if _gap < 0.0:
-                        _gap = 0.0
-                    rel_gap_sched = _gap / max(1.0, abs(float(best_ub)))
-                if rel_gap_sched is not None:
-                    if rel_gap_sched > 0.15:
-                        tl = 2.0
-                        mg = 0.05
-                    elif rel_gap_sched > 0.05:
-                        tl = 5.0
-                        mg = 0.03
-                    else:
-                        tl = 10.0
-                        mg = 0.01
-                    try:
-                        if isinstance(getattr(self.master, "params", None), dict):
-                            self.master.params["solve_time_limit_s"] = tl
-                            self.master.params["mipgap"] = mg
-                    except Exception:
-                        pass
-                    print(f"[SCHEDULE] master time_limit_s={tl:.0f} mipgap={mg:.2g} (rel_gap={rel_gap_sched:.3g})")
+                if isinstance(getattr(self.master, "params", None), dict):
+                    self.master.params["iteration"] = int(it)
             except Exception:
                 pass
+            # Tightening phase: if no new cuts are being added, solve MP harder to raise LB
+            if no_cut_streak >= 2:
+                try:
+                    if isinstance(getattr(self.master, "params", None), dict):
+                        cur_tl = float(self.master.params.get("solve_time_limit_s", 0) or 0.0)
+                        cur_gap = self.master.params.get("mipgap")
+                        cur_gap = float(cur_gap) if cur_gap is not None else 1.0
+                        if no_cut_streak >= 3:
+                            tl = max(cur_tl, 60.0)
+                            mg = min(cur_gap, 0.001)
+                        else:
+                            tl = max(cur_tl, 30.0)
+                            mg = min(cur_gap, 0.01)
+                        self.master.params["solve_time_limit_s"] = tl
+                        self.master.params["mipgap"] = mg
+                        print(f"[TIGHTEN] no new cuts for {no_cut_streak} iters: time_limit_s={tl:.0f} mipgap={mg:.3g}")
+                except Exception:
+                    pass
+            # Dynamic master solve schedule based on current relative gap (if available)
+            if no_cut_streak < 2:
+                try:
+                    # Default: quick MP every iteration; deep MP every K iterations
+                    do_deep = (it % deep_mp_every == 0)
+                    # If last MP could not meet target gap, trigger a deeper solve
+                    if last_mp_gap is not None and last_mp_gap > quick_mp_gap:
+                        do_deep = True
+                    if isinstance(getattr(self.master, "params", None), dict):
+                        tl = deep_mp_time if do_deep else quick_mp_time
+                        mg = deep_mp_gap if do_deep else quick_mp_gap
+                        self.master.params["solve_time_limit_s"] = tl
+                        self.master.params["mipgap"] = mg
+                    tag = "deep" if do_deep else "quick"
+                    print(f"[SCHEDULE] master {tag}: time_limit_s={tl:.0f} mipgap={mg:.2g}")
+                except Exception:
+                    pass
             mp_t0 = time.perf_counter()
             mres = self.master.solve()
             mp_t1 = time.perf_counter()
@@ -641,23 +634,58 @@ class BendersSolver:
             theta_out_inc = None
             theta_ret_inc = None
             try:
-                # Prefer a master helper if available
+                def _safe_value(v) -> float | None:
+                    try:
+                        return pyo.value(v, exception=False)
+                    except Exception:
+                        return None
+
+                def _read_scalar_or_indexed(v) -> float | None:
+                    try:
+                        if hasattr(v, "is_indexed") and v.is_indexed():
+                            if None in v:
+                                return _safe_value(v[None])
+                            if len(v) == 1:
+                                return _safe_value(next(iter(v.values())))
+                            return None
+                        return _safe_value(v)
+                    except Exception:
+                        return None
+
+                m = getattr(self.master, "m", None)
+                if m is not None:
+                    if hasattr(m, "theta"):
+                        theta_inc = _read_scalar_or_indexed(m.theta)
+                    if hasattr(m, "theta_out"):
+                        theta_out_inc = _read_scalar_or_indexed(m.theta_out)
+                    if hasattr(m, "theta_ret"):
+                        theta_ret_inc = _read_scalar_or_indexed(m.theta_ret)
+                    if (theta_inc is None) and hasattr(m, "theta_s"):
+                        try:
+                            vals = []
+                            for s in m.theta_s:
+                                v = _safe_value(m.theta_s[s])
+                                if v is not None:
+                                    vals.append(float(v))
+                            if vals:
+                                theta_inc = float(sum(vals))
+                        except Exception:
+                            pass
+
+                # Prefer a master helper if it can add extra fields, but do not overwrite model values
                 get_theta = getattr(self.master, "get_theta_values", None)
                 if callable(get_theta):
-                    tv = get_theta()
+                    try:
+                        tv = get_theta()
+                    except Exception:
+                        tv = None
                     if isinstance(tv, dict):
-                        theta_inc = float(tv.get("theta", 0.0))
-                        theta_out_inc = tv.get("theta_out")
-                        theta_ret_inc = tv.get("theta_ret")
-                else:
-                    m = getattr(self.master, "m", None)
-                    if m is not None:
-                        if hasattr(m, "theta"):
-                            theta_inc = float(pyo.value(m.theta, exception=False) or 0.0)
-                        if hasattr(m, "theta_out"):
-                            theta_out_inc = float(pyo.value(m.theta_out, exception=False) or 0.0)
-                        if hasattr(m, "theta_ret"):
-                            theta_ret_inc = float(pyo.value(m.theta_ret, exception=False) or 0.0)
+                        if theta_inc is None and tv.get("theta") is not None:
+                            theta_inc = float(tv.get("theta"))
+                        if theta_out_inc is None and tv.get("theta_out") is not None:
+                            theta_out_inc = float(tv.get("theta_out"))
+                        if theta_ret_inc is None and tv.get("theta_ret") is not None:
+                            theta_ret_inc = float(tv.get("theta_ret"))
             except Exception:
                 pass
             if theta_inc is None:
@@ -692,17 +720,40 @@ class BendersSolver:
                     log.warning("[CHECK WARN] theta_read differs from implied by >1e-3; verify MP theta vars.")
             # Best bound from solver stats if available
             mp_best_bound = None
+            mp_best_integer = None
+            mp_term = None
+            mp_status = None
+            mp_incumbent = None
+            mp_gap = None
+            bb_source = None
+            inc_source = None
+            gap_source = None
+            bb_reason = None
             try:
                 stats = getattr(self.master, "last_solve_stats", lambda: {})()
                 mp_best_bound = stats.get("best_bound")
                 mp_best_integer = stats.get("best_integer")
+                mp_incumbent = stats.get("incumbent")
+                mp_gap = stats.get("gap")
                 mp_term = stats.get("termination_condition")
                 mp_status = stats.get("status")
+                bb_source = stats.get("best_bound_source")
+                inc_source = stats.get("incumbent_source")
+                gap_source = stats.get("gap_source")
+                bb_reason = stats.get("best_bound_reason")
             except Exception:
-                mp_best_bound = None
-                mp_best_integer = None
-                mp_term = None
-                mp_status = None
+                pass
+            if mp_incumbent is None:
+                mp_incumbent = mp_best_integer
+            if mp_gap is None and mp_incumbent is not None and mp_best_bound is not None:
+                try:
+                    gap_val = (float(mp_incumbent) - float(mp_best_bound)) / max(1.0, abs(float(mp_incumbent)))
+                    if gap_val < 0.0:
+                        gap_val = 0.0
+                    mp_gap = gap_val
+                    gap_source = "computed"
+                except Exception:
+                    pass
             print(
                 "[CHECK] MP: first=%.6g theta=%.6g mp_total=%.6g inc_obj=%s best_bound=%s"
                 % (
@@ -714,13 +765,31 @@ class BendersSolver:
                 )
             )
             print(
-                "[CHECK] MP bounds: mp_obj=%s mp_best_bound=%s mp_best_integer=%s term=%s status=%s"
+                "[CHECK] MP bounds: mp_obj=%s mp_best_bound=%s mp_best_integer=%s term=%s status=%s gap=%s"
                 % (
                     (f"{mp_inc_obj:.6g}" if mp_inc_obj is not None else "-"),
                     (f"{float(mp_best_bound):.6g}" if mp_best_bound is not None else "-"),
                     (f"{float(mp_best_integer):.6g}" if mp_best_integer is not None else "-"),
                     (str(mp_term) if mp_term is not None else "-"),
                     (str(mp_status) if mp_status is not None else "-"),
+                    (f"{float(mp_gap):.6g}" if mp_gap is not None else "-"),
+                )
+            )
+            try:
+                last_mp_gap = float(mp_gap) if mp_gap is not None else None
+            except Exception:
+                last_mp_gap = None
+            last_mp_term = str(mp_term) if mp_term is not None else None
+            print(
+                "[MP] iter=%d incumbent=%s best_bound=%s gap=%s (src: inc=%s bb=%s gap=%s)"
+                % (
+                    it,
+                    (f"{float(mp_incumbent):.6g}" if mp_incumbent is not None else "-"),
+                    (f"{float(mp_best_bound):.6g}" if mp_best_bound is not None else "-"),
+                    (f"{float(mp_gap):.6g}" if mp_gap is not None else "-"),
+                    (str(inc_source) if inc_source is not None else "-"),
+                    (str(bb_source) if bb_source is not None else "-"),
+                    (str(gap_source) if gap_source is not None else "-"),
                 )
             )
 
@@ -748,24 +817,23 @@ class BendersSolver:
 
             # Update lower bound if provided
             # Prefer solver best bound when available
-            mp_best_bound = None
-            try:
-                stats = getattr(self.master, "last_solve_stats", lambda: {})()
-                mp_best_bound = stats.get("best_bound")
-            except Exception:
-                mp_best_bound = None
             if mp_best_bound is None:
                 try:
                     log_path = getattr(self.master, "last_solver_log_path", lambda: None)()
                 except Exception:
                     log_path = None
-                _, bb = _parse_cplex_best_bound(log_path)
-                if bb is not None:
-                    mp_best_bound = bb
+                parsed = parse_cplex_log_bounds(log_path)
+                if parsed.get("best_bound") is not None:
+                    mp_best_bound = parsed.get("best_bound")
+                    bb_source = "cplex_log"
+                elif bb_reason is None:
+                    bb_reason = "not_in_solver_or_log"
             if mp_best_bound is not None:
                 best_lb = float(mp_best_bound) if best_lb is None else max(best_lb, float(mp_best_bound))
             else:
-                log.warning("[CHECK] MP best bound unavailable; LB not updated.")
+                reason = f" reason={bb_reason}" if bb_reason is not None else ""
+                log.warning("[CHECK] MP best bound unavailable; LB not updated.%s", reason)
+                print(f"[MP] best_bound unavailable{reason}")
 
             if not mres.candidate:
                 log.error("Master did not return a candidate solution")
@@ -965,9 +1033,11 @@ class BendersSolver:
                 log.info("added %d cut(s)", added)
                 names_str = ", ".join(cut_names) if cut_names else "(unnamed)"
                 print(f"Master updated: added {added} cut(s): {names_str}")
+                no_cut_streak = 0
             else:
                 if cut_names:
                     print("Master updated: no new cuts (all skipped / duplicates)")
+                no_cut_streak += 1
             # Invariant: first iteration with finite SP UB must add at least one cut
             if (
                 it == 1
