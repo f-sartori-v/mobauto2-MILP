@@ -75,6 +75,26 @@ def make_cut_signature(const: float, slopes: Mapping[Any, float] | Iterable[tupl
     return (scope_key, rc, tuple(items))
 
 
+def make_slope_signature(slopes: Mapping[Any, float] | Iterable[tuple[Any, float]], scope: Any | None = None) -> tuple:
+    """Build a canonical signature based only on slopes (ignore const)."""
+    if not isinstance(slopes, Mapping):
+        slopes = dict(slopes)  # type: ignore[arg-type]
+    items: list[tuple[Any, float]] = []
+    for k, v in slopes.items():
+        vv = float(v)
+        if abs(vv) <= COEFF_ZERO_TOL:
+            continue
+        items.append((k, round(vv, COEFF_ROUND_DIGITS)))
+    items.sort(key=lambda kv: _key_for_sort(kv[0]))
+    if scope is None:
+        return tuple(items)
+    try:
+        scope_key = tuple(scope) if not isinstance(scope, (int, float, str)) else scope
+    except Exception:
+        scope_key = repr(scope)
+    return (scope_key, tuple(items))
+
+
 def set_cut_tolerances(eps_cut: float, eps_hash: float) -> None:
     global VIOL_TOL_REL, COEFF_ZERO_TOL, COEFF_ROUND_DIGITS
     try:
@@ -103,6 +123,7 @@ def add_benders_cut(
     signature_scope: Any | None = None,
     cuts_in_model: int | None = None,
     signature_set: set[tuple] | None = None,
+    slope_const_map: dict[tuple, float] | None = None,
 ) -> bool:
     """Common filter for adding a Benders cut.
 
@@ -171,6 +192,18 @@ def add_benders_cut(
     if abs(float(const)) <= COEFF_ZERO_TOL and all(abs(float(v)) <= COEFF_ZERO_TOL for v in _slopes_dict.values()):
         log.info("[BENDERS] skip reason=numerically_empty signature=None cuts_in_model=%s", str(cuts_in_model))
         return False
+
+    # Dominance pruning by slope pattern: keep only the largest const for a given slope signature
+    if slope_const_map is not None:
+        try:
+            slope_sig = make_slope_signature(_slopes_dict, scope=signature_scope)
+            prev_const = slope_const_map.get(slope_sig)
+            if prev_const is not None and float(const) <= float(prev_const) + 1e-9:
+                log.info("[BENDERS] skip reason=dominated_by_slope signature=%s cuts_in_model=%s", str(slope_sig), str(cuts_in_model))
+                return False
+            slope_const_map[slope_sig] = float(const)
+        except Exception:
+            pass
 
     # If this is the very first cut, accept (unless numerically empty)
     if cuts_in_model == 0:
@@ -253,15 +286,17 @@ class BendersSolver:
         no_cut_streak = 0
         last_mp_gap: Optional[float] = None
         last_mp_term: Optional[str] = None
-        deep_mp_every = 5
-        quick_mp_time = 2.0
-        quick_mp_gap = 0.05
-        deep_mp_time = 20.0
-        deep_mp_gap = 0.01
+        # Master schedule parameters tied to global BD gap
+        mp_gap_min = 0.001
+        mp_gap_max = 0.05
+        mp_gap_scale = 1.0
+        mp_time_base = 2.0
+        mp_time_k = 5.0
         # MW config (default enabled)
-        mw_enabled = bool(getattr(self.cfg.solver, "mw_enabled", True))
-        mw_alpha = float(getattr(self.cfg.solver, "mw_core_alpha", 0.10) or 0.10)
-        mw_eps = float(getattr(self.cfg.solver, "mw_core_eps", 1e-3) or 1e-3)
+        sp_params = self.subproblem.params or {}
+        mw_enabled = bool(sp_params.get("use_magnanti_wong", self.cfg.subproblem.use_magnanti_wong))
+        mw_alpha = float(sp_params.get("mw_core_alpha", self.cfg.subproblem.mw_core_alpha) or 0.10)
+        mw_eps = float(sp_params.get("mw_core_eps", getattr(self.cfg.subproblem, "mw_core_eps", 1e-3)) or 1e-3)
         if not (0.0 < mw_alpha <= 1.0):
             mw_alpha = 0.10
         if mw_eps <= 0.0:
@@ -599,21 +634,23 @@ class BendersSolver:
                         print(f"[TIGHTEN] no new cuts for {no_cut_streak} iters: time_limit_s={tl:.0f} mipgap={mg:.3g}")
                 except Exception:
                     pass
-            # Dynamic master solve schedule based on current relative gap (if available)
+            # Dynamic master solve schedule based on current global BD gap
             if no_cut_streak < 2:
                 try:
-                    # Default: quick MP every iteration; deep MP every K iterations
-                    do_deep = (it % deep_mp_every == 0)
-                    # If last MP could not meet target gap, trigger a deeper solve
-                    if last_mp_gap is not None and last_mp_gap > quick_mp_gap:
-                        do_deep = True
+                    g_bd = None
+                    if best_lb is not None and best_ub is not None:
+                        gap = float(best_ub) - float(best_lb)
+                        if gap < 0.0:
+                            gap = 0.0
+                        g_bd = gap / max(1.0, abs(float(best_ub)))
+                    if g_bd is None:
+                        g_bd = float(mp_gap_max)
+                    mp_gap = min(float(mp_gap_max), max(float(mp_gap_min), float(mp_gap_scale) * float(g_bd)))
+                    mp_tl = float(mp_time_base) + (float(mp_time_k) / max(float(mp_gap), 1e-4))
                     if isinstance(getattr(self.master, "params", None), dict):
-                        tl = deep_mp_time if do_deep else quick_mp_time
-                        mg = deep_mp_gap if do_deep else quick_mp_gap
-                        self.master.params["solve_time_limit_s"] = tl
-                        self.master.params["mipgap"] = mg
-                    tag = "deep" if do_deep else "quick"
-                    print(f"[SCHEDULE] master {tag}: time_limit_s={tl:.0f} mipgap={mg:.2g}")
+                        self.master.params["solve_time_limit_s"] = mp_tl
+                        self.master.params["mipgap"] = mp_gap
+                    print(f"[SCHEDULE] master gap-tied: time_limit_s={mp_tl:.0f} mipgap={mp_gap:.2g} g_bd={g_bd:.3g}")
                 except Exception:
                     pass
             mp_t0 = time.perf_counter()
@@ -946,13 +983,12 @@ class BendersSolver:
                     if isinstance(getattr(self.subproblem, "params", None), dict):
                         if self._mw_core_out is not None and self._mw_core_ret is not None:
                             self.subproblem.params["mw_core_point"] = {"Yout": list(self._mw_core_out), "Yret": list(self._mw_core_ret)}
-                        self.subproblem.params["use_magnanti_wong"] = mw_enabled
                 except Exception:
                     pass
             else:
                 try:
                     if isinstance(getattr(self.subproblem, "params", None), dict):
-                        self.subproblem.params["use_magnanti_wong"] = mw_enabled
+                        pass
                 except Exception:
                     pass
 

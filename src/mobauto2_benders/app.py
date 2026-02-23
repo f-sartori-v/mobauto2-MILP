@@ -108,6 +108,7 @@ def _prepare_params(cfg, overrides: dict | None) -> tuple[dict, dict]:
     sp["multi_cuts_by_scenario"] = bool(cfg.subproblem.multi_cuts_by_scenario)
     sp["use_magnanti_wong"] = bool(cfg.subproblem.use_magnanti_wong)
     sp["mw_core_alpha"] = float(cfg.subproblem.mw_core_alpha)
+    sp["mw_core_eps"] = float(getattr(cfg.subproblem, "mw_core_eps", 1e-3))
     sp["use_dual_slopes"] = bool(cfg.subproblem.use_dual_slopes)
     sp["S"] = cfg.subproblem.S
     _set_if_not_none(sp, "Wmax_minutes", cfg.subproblem.Wmax_minutes)

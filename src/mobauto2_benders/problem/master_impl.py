@@ -23,6 +23,8 @@ class ProblemMaster(MasterProblem):
         self._cut_fps: set[tuple] = set()
         # Per-run cut signatures to avoid duplicates (reset in initialize)
         self._cut_signatures: set[tuple] = set()
+        # Per-run dominance map: slope signature -> best (largest) const
+        self._cut_best_const: dict[tuple, float] = {}
         self._last_log_path: Optional[str] = None
         # Optional: warm start values for yOUT/yRET at next solve
         # Keys: ("yOUT"|"yRET", q:int, t:int) -> float(0/1)
@@ -84,6 +86,7 @@ class ProblemMaster(MasterProblem):
     def initialize(self) -> None:
         # Reset per-run cut signatures
         self._cut_signatures = set()
+        self._cut_best_const = {}
         Q = int(self._p("Q"))
         # Time discretization: prefer minutes + slot_resolution + trip_duration_minutes
         import math
@@ -373,6 +376,7 @@ class ProblemMaster(MasterProblem):
         m = self.m
         solver = self._get_solver()
         tee_flag = bool(self._p("solver_tee", self._p("mp_solve_tee", False)))
+        emit_reports = bool(self._p("emit_reports", True))
         # Per-iteration solver controls
         try:
             time_limit = self._p("solve_time_limit_s")
@@ -526,12 +530,26 @@ class ProblemMaster(MasterProblem):
 
         res = solver.solve(
             m,
-            tee=True,
+            tee=bool(tee_flag and emit_reports),
             warmstart=use_ws,
-            load_solutions=True,
-            keepfiles=True,
+            load_solutions=False,
+            keepfiles=bool(emit_reports),
             symbolic_solver_labels=True,
         )
+        term = getattr(res.solver, "termination_condition", None)
+        if term in (pyo.TerminationCondition.optimal, pyo.TerminationCondition.feasible, pyo.TerminationCondition.maxTimeLimit):
+            try:
+                m.solutions.load_from(res)
+            except Exception:
+                # Retry once with solution loading enabled
+                res = solver.solve(
+                    m,
+                    tee=bool(tee_flag and emit_reports),
+                    warmstart=use_ws,
+                    load_solutions=True,
+                    keepfiles=bool(emit_reports),
+                    symbolic_solver_labels=True,
+                )
         # Try to capture the actual solver log path (including temp log from direct interfaces)
         try:
             for attr in ("logfile", "log_file", "_log_file", "_logfile", "log_path", "_log_path", "log", "logfile_name", "log_filename"):
@@ -1120,6 +1138,7 @@ class ProblemMaster(MasterProblem):
                     signature_scope=("dir:out", scen_idx),
                     cuts_in_model=self._cut_idx,
                     signature_set=self._cut_signatures,
+                    slope_const_map=self._cut_best_const,
                 )
                 added_ret = add_benders_cut(
                     iteration=-1,
@@ -1131,6 +1150,7 @@ class ProblemMaster(MasterProblem):
                     signature_scope=("dir:ret", scen_idx),
                     cuts_in_model=self._cut_idx,
                     signature_set=self._cut_signatures,
+                    slope_const_map=self._cut_best_const,
                 )
                 if not (added_out or added_ret):
                     return False
@@ -1175,6 +1195,7 @@ class ProblemMaster(MasterProblem):
                     signature_scope=("scen", scen_idx),
                     cuts_in_model=self._cut_idx,
                     signature_set=self._cut_signatures,
+                    slope_const_map=self._cut_best_const,
                 )
                 if not ok:
                     return False

@@ -101,6 +101,7 @@ class SubproblemSection:
     multi_cuts_by_scenario: bool = True
     use_magnanti_wong: bool = False
     mw_core_alpha: float = 0.3
+    mw_core_eps: float = 1e-3
     use_dual_slopes: bool = False
     S: float = 0.0
     Wmax_minutes: int | None = None
@@ -412,6 +413,7 @@ def upgrade_config_v1_to_v2(old: Mapping[str, Any]) -> dict[str, Any]:
             "multi_cuts_by_scenario": sub_params.get("multi_cuts_by_scenario", True),
             "use_magnanti_wong": sub_params.get("use_magnanti_wong", False),
             "mw_core_alpha": sub_params.get("mw_core_alpha", 0.3),
+            "mw_core_eps": sub_params.get("mw_core_eps", 1e-3),
             "use_dual_slopes": sub_params.get("use_dual_slopes", False),
             "S": sub_params.get("S"),
             "Wmax_minutes": sub_params.get("Wmax_minutes"),
@@ -665,6 +667,7 @@ def _parse_v2(raw: Mapping[str, Any]) -> RootConfig:
             "multi_cuts_by_scenario",
             "use_magnanti_wong",
             "mw_core_alpha",
+            "mw_core_eps",
             "use_dual_slopes",
             "S",
             "Wmax_minutes",
@@ -684,6 +687,10 @@ def _parse_v2(raw: Mapping[str, Any]) -> RootConfig:
         mw_core_alpha=_ensure_float(
             _disallow_expr(sub_raw.get("mw_core_alpha", 0.3), "subproblem.mw_core_alpha"),
             "subproblem.mw_core_alpha",
+        ),
+        mw_core_eps=_ensure_float(
+            _disallow_expr(sub_raw.get("mw_core_eps", 1e-3), "subproblem.mw_core_eps"),
+            "subproblem.mw_core_eps",
         ),
         use_dual_slopes=_ensure_bool(sub_raw.get("use_dual_slopes", False), "subproblem.use_dual_slopes"),
         S=_ensure_float(_disallow_expr(sub_raw.get("S"), "subproblem.S"), "subproblem.S"),
