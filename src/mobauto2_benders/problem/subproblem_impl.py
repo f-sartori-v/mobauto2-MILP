@@ -33,6 +33,13 @@ class ProblemSubproblem(Subproblem):
     def __init__(self, params: dict[str, Any] | None = None):
         super().__init__(params)
 
+    def _is_report(self) -> bool:
+        return str((self.params or {}).get("log_level", "")).upper() == "REPORT"
+
+    def _vprint(self, *args, **kwargs) -> None:
+        if not self._is_report():
+            print(*args, **kwargs)
+
     def _parse_candidate_indices(self, candidate: Candidate) -> Tuple[set[int], set[int]]:
         qs: set[int] = set()
         ts: set[int] = set()
@@ -48,6 +55,7 @@ class ProblemSubproblem(Subproblem):
 
     def evaluate(self, candidate: Candidate) -> SubproblemResult:
         params = self.params or {}
+        debug_early_exit = bool(params.get("debug_early_exit", False))
         # Parameters (with safe defaults)
         S = float(params.get("S", 1.0))
         # Resolution in minutes per slot (copied from master params via config or set here)
@@ -59,7 +67,8 @@ class ProblemSubproblem(Subproblem):
         else:
             Wmax = int(params.get("Wmax_slots", params.get("Wmax", 0)))
         p_pen = float(params.get("p", 0.0))
-        eps_cut = float(params.get("eps_cut", 1e-8))
+        _eps_raw = params.get("eps_cut", None)
+        eps_cut = float(_eps_raw) if _eps_raw is not None else 1e-6
         lp_solver = str(params.get("lp_solver", "cplex_direct"))
         # Optional: solver-specific options (e.g., CPLEX: {"lpmethod": 2, "threads": 0})
         solver_options = dict(params.get("solver_options", {}) or {})
@@ -169,6 +178,23 @@ class ProblemSubproblem(Subproblem):
                 return R_out, R_ret
             return R_out, R_ret
 
+        def _ok(lhs: float | None, rhs: float | None, eps: float) -> bool:
+            if lhs is None or rhs is None:
+                return False
+            return float(lhs) >= float(rhs) - float(eps) * (1.0 + abs(float(rhs)))
+
+        def _cand_theta(key: str) -> float | None:
+            try:
+                v = candidate.get(key)
+            except Exception:
+                v = None
+            if v is None:
+                return None
+            try:
+                return float(v)
+            except Exception:
+                return None
+
         def _load_demand_from_file(path_like: Any, Tlen: int) -> tuple[list[float], list[float]]:
             p = Path(str(path_like))
             doc = _load_doc(p)
@@ -213,6 +239,22 @@ class ProblemSubproblem(Subproblem):
         # Allow specifying scenarios as file paths
         if not scenarios and isinstance(params.get("scenario_files"), list):
             scenarios = list(params.get("scenario_files"))
+        # Normalize single-scenario lists to single-demand path
+        single_scenario_override: tuple[list[float], list[float]] | None = None
+        if scenarios and len(scenarios) == 1:
+            s0 = scenarios[0]
+            if isinstance(s0, (str, Path)):
+                R_out0, R_ret0 = _load_demand_from_file(s0, T)
+            elif isinstance(s0, dict) and ("requests" in s0 or "req_matrix" in s0 or "R_out" in s0 or "R_ret" in s0):
+                R_out0, R_ret0 = _aggregate_requests(s0, T)
+            else:
+                # Best effort
+                R_out0 = list(getattr(s0, "R_out", [0.0] * T))
+                R_ret0 = list(getattr(s0, "R_ret", [0.0] * T))
+            R_out0 = (R_out0 + [0.0] * T)[:T]
+            R_ret0 = (R_ret0 + [0.0] * T)[:T]
+            single_scenario_override = (R_out0, R_ret0)
+            scenarios = []
         # Multi-cut vs averaged cut control.
         # New flag: multi_cuts_by_scenario (True => return one cut per scenario)
         # Backward compat: if not provided, use legacy average_cuts_across_scenarios (True => single averaged cut)
@@ -422,6 +464,7 @@ class ProblemSubproblem(Subproblem):
             coeffs_out_list: list[Dict[tuple[int, int], float]] = []
             coeffs_ret_list: list[Dict[tuple[int, int], float]] = []
             scenario_diags: list[dict] = []
+            scenario_records: list[dict] = []
             agg = {
                 "objective_value": [],
                 "waiting_cost_slots": [],
@@ -457,6 +500,177 @@ class ProblemSubproblem(Subproblem):
                 t_solve1 = time.perf_counter()
                 sp_solve_time = t_solve1 - t_solve0
                 ub_vals.append(ub_val)
+
+                scenario_records.append({
+                    "idx": int(idx_s),
+                    "label": scen_label,
+                    "R_out": R_out,
+                    "R_ret": R_ret,
+                    "duals": duals,
+                    "ub_val": float(ub_val),
+                    "sp_solve_time": float(sp_solve_time),
+                })
+                agg["objective_value"].append(float(duals.get("objective_value", ub_val)))
+                agg["waiting_cost_slots"].append(float(duals.get("waiting_cost_slots", 0.0)))
+                agg["fill_eps_cost"].append(float(duals.get("fill_eps_cost", 0.0)))
+                agg["penalty_cost"].append(float(duals.get("penalty_cost", 0.0)))
+                agg["penalty_pax"].append(float(duals.get("penalty_pax", 0.0)))
+                agg["served_total"].append(float(duals.get("served_total", 0.0)))
+                agg["total_demand"].append(float(duals.get("total_demand", 0.0)))
+                agg.setdefault("timing_sp_solve_s", []).append(sp_solve_time)
+
+            # Aggregate UB
+            if ub_aggregation == "mean":
+                ub_val_agg = sum(w * u for w, u in zip(weights, ub_vals))
+                agg_obj = sum(w * u for w, u in zip(weights, agg["objective_value"]))
+                agg_wait = sum(w * u for w, u in zip(weights, agg["waiting_cost_slots"]))
+                agg_fill = sum(w * u for w, u in zip(weights, agg["fill_eps_cost"]))
+                agg_pen = sum(w * u for w, u in zip(weights, agg["penalty_cost"]))
+                agg_pen_pax = sum(w * u for w, u in zip(weights, agg["penalty_pax"]))
+                agg_served = sum(w * u for w, u in zip(weights, agg["served_total"]))
+                agg_total = sum(w * u for w, u in zip(weights, agg["total_demand"]))
+            elif ub_aggregation == "sum":
+                ub_val_agg = sum(ub_vals)
+                agg_obj = sum(agg["objective_value"])
+                agg_wait = sum(agg["waiting_cost_slots"])
+                agg_fill = sum(agg["fill_eps_cost"])
+                agg_pen = sum(agg["penalty_cost"])
+                agg_pen_pax = sum(agg["penalty_pax"])
+                agg_served = sum(agg["served_total"])
+                agg_total = sum(agg["total_demand"])
+            elif ub_aggregation == "max":
+                ub_val_agg = max(ub_vals)
+                idx_max = int(ub_vals.index(ub_val_agg))
+                agg_obj = agg["objective_value"][idx_max]
+                agg_wait = agg["waiting_cost_slots"][idx_max]
+                agg_fill = agg["fill_eps_cost"][idx_max]
+                agg_pen = agg["penalty_cost"][idx_max]
+                agg_pen_pax = agg["penalty_pax"][idx_max]
+                agg_served = agg["served_total"][idx_max]
+                agg_total = agg["total_demand"][idx_max]
+            else:
+                raise ValueError("ub_aggregation must be one of 'mean', 'sum', 'max'")
+
+            # Early-exit for scalar theta in multi-scenario runs (skip all cut generation)
+            theta_val = _cand_theta("__theta")
+            has_theta_s = any(isinstance(k, str) and k.startswith("__theta_s[") for k in candidate.keys())
+            if debug_early_exit:
+                try:
+                    rhs = float(ub_val_agg) - float(eps_cut) * (1.0 + abs(float(ub_val_agg)))
+                except Exception:
+                    rhs = None
+                try:
+                    theta_keys = [k for k in candidate.keys() if isinstance(k, str) and k.startswith("__theta")][:20]
+                except Exception:
+                    theta_keys = []
+                early_exit_ok = (theta_val is not None) and (not has_theta_s) and _ok(theta_val, float(ub_val_agg), eps_cut)
+                msg = (
+                    "[EARLY-EXIT] scenarios=%s theta_val=%s has_theta_s=%s ub_val_agg=%s eps_cut=%s rhs=%s early_exit_ok=%s theta_keys=%s"
+                    % (
+                        str(len(scenarios)),
+                        (f"{float(theta_val):.6g}" if theta_val is not None else "-"),
+                        str(bool(has_theta_s)),
+                        (f"{float(ub_val_agg):.6g}" if ub_val_agg is not None else "-"),
+                        (f"{float(eps_cut):.6g}" if eps_cut is not None else "-"),
+                        (f"{float(rhs):.6g}" if rhs is not None else "-"),
+                        str(bool(early_exit_ok)),
+                        str(theta_keys),
+                    )
+                )
+                try:
+                    import logging as _logging
+                    _log = _logging.getLogger(__name__)
+                    _log.setLevel(_logging.INFO)
+                    if not _log.handlers:
+                        _logging.basicConfig(level=_logging.INFO)
+                    _log.info(msg)
+                except Exception:
+                    self._vprint(msg)
+            if (theta_val is not None) and (not has_theta_s) and _ok(theta_val, float(ub_val_agg), eps_cut):
+                for rec in scenario_records:
+                    duals = rec["duals"]
+                    R_out = rec["R_out"]
+                    R_ret = rec["R_ret"]
+                    scenario_diags.append({
+                        "label": rec["label"],
+                        "T": T,
+                        "R_out": [float(R_out[t]) for t in range(T)],
+                        "R_ret": [float(R_ret[t]) for t in range(T)],
+                        "pax_out_by_tau": list(duals.get("served_out_by_tau", [0.0] * T)),
+                        "pax_ret_by_tau": list(duals.get("served_ret_by_tau", [0.0] * T)),
+                        "pax_out_by_tau_k": list(duals.get("served_out_by_tau_k", [[] for _ in range(T)])),
+                        "pax_ret_by_tau_k": list(duals.get("served_ret_by_tau_k", [[] for _ in range(T)])),
+                        "objective_value": float(duals.get("objective_value", rec["ub_val"])),
+                        "waiting_cost_slots": float(duals.get("waiting_cost_slots", 0.0)),
+                        "fill_eps_cost": float(duals.get("fill_eps_cost", 0.0)),
+                        "penalty_cost": float(duals.get("penalty_cost", 0.0)),
+                        "penalty_pax": float(duals.get("penalty_pax", 0.0)),
+                        "served_total": float(duals.get("served_total", 0.0)),
+                        "total_demand": float(duals.get("total_demand", 0.0)),
+                        "timing_sp_solve_s": rec["sp_solve_time"],
+                        "timing_cutgen_s": 0.0,
+                    })
+                return SubproblemResult(
+                    is_feasible=True,
+                    cuts=[],
+                    upper_bound=ub_val_agg,
+                    diagnostics={
+                        "T": T,
+                        "scenarios": scenario_diags,
+                        "scenario_weights": list(weights) if weights is not None else None,
+                        "objective_value": agg_obj,
+                        "waiting_cost_slots": agg_wait,
+                        "fill_eps_cost": agg_fill,
+                        "penalty_cost": agg_pen,
+                        "penalty_pax": agg_pen_pax,
+                        "served_total": agg_served,
+                        "total_demand": agg_total,
+                        "slot_resolution": int(params.get("slot_resolution", 1)),
+                        "timing_sp_solve_s": sum(float(x) for x in agg.get("timing_sp_solve_s", []) or []),
+                        "timing_cutgen_s": 0.0,
+                    },
+                )
+
+            # Phase 2: generate cuts (unless early-exit above)
+            use_dual = bool(params.get("use_dual_slopes", False))
+            K_out_lp = [max(1, int(K_out[t])) for t in range(T)] if use_dual else K_out
+            K_ret_lp = [max(1, int(K_ret[t])) for t in range(T)] if use_dual else K_ret
+            for rec in scenario_records:
+                idx_s = int(rec["idx"])
+                scen_label = rec["label"]
+                R_out = rec["R_out"]
+                R_ret = rec["R_ret"]
+                duals = rec["duals"]
+                ub_val = float(rec["ub_val"])
+                sp_solve_time = float(rec["sp_solve_time"])
+
+                # Early-exit per scenario if per-scenario theta is already consistent
+                # Skip any cut generation work for this scenario.
+                theta_s = _cand_theta(f"__theta_s[{int(idx_s)}]")
+                if (theta_s is not None) and _ok(theta_s, float(ub_val), eps_cut):
+                    cutgen_time = 0.0
+                    # Collect per-scenario diagnostics for reporting
+                    scenario_diags.append({
+                        "label": scen_label,
+                        "T": T,
+                        "R_out": [float(R_out[t]) for t in range(T)],
+                        "R_ret": [float(R_ret[t]) for t in range(T)],
+                        "pax_out_by_tau": list(duals.get("served_out_by_tau", [0.0] * T)),
+                        "pax_ret_by_tau": list(duals.get("served_ret_by_tau", [0.0] * T)),
+                        "pax_out_by_tau_k": list(duals.get("served_out_by_tau_k", [[] for _ in range(T)])),
+                        "pax_ret_by_tau_k": list(duals.get("served_ret_by_tau_k", [[] for _ in range(T)])),
+                        "objective_value": float(duals.get("objective_value", ub_val)),
+                        "waiting_cost_slots": float(duals.get("waiting_cost_slots", 0.0)),
+                        "fill_eps_cost": float(duals.get("fill_eps_cost", 0.0)),
+                        "penalty_cost": float(duals.get("penalty_cost", 0.0)),
+                        "penalty_pax": float(duals.get("penalty_pax", 0.0)),
+                        "served_total": float(duals.get("served_total", 0.0)),
+                        "total_demand": float(duals.get("total_demand", 0.0)),
+                        "timing_sp_solve_s": sp_solve_time,
+                        "timing_cutgen_s": cutgen_time,
+                    })
+                    agg.setdefault("timing_cutgen_s", []).append(cutgen_time)
+                    continue
 
                 # Build marginal slopes either from duals (fast) or finite differences (fallback)
                 t_cut0 = time.perf_counter()
@@ -591,22 +805,7 @@ class ProblemSubproblem(Subproblem):
                     "timing_sp_solve_s": sp_solve_time,
                     "timing_cutgen_s": cutgen_time,
                 })
-                agg["objective_value"].append(float(duals.get("objective_value", ub_val)))
-                agg["waiting_cost_slots"].append(float(duals.get("waiting_cost_slots", 0.0)))
-                agg["fill_eps_cost"].append(float(duals.get("fill_eps_cost", 0.0)))
-                agg["penalty_cost"].append(float(duals.get("penalty_cost", 0.0)))
-                agg["penalty_pax"].append(float(duals.get("penalty_pax", 0.0)))
-                agg["served_total"].append(float(duals.get("served_total", 0.0)))
-                agg["total_demand"].append(float(duals.get("total_demand", 0.0)))
-                agg.setdefault("timing_sp_solve_s", []).append(sp_solve_time)
                 agg.setdefault("timing_cutgen_s", []).append(cutgen_time)
-                agg["objective_value"].append(float(duals.get("objective_value", ub_val)))
-                agg["waiting_cost_slots"].append(float(duals.get("waiting_cost_slots", 0.0)))
-                agg["fill_eps_cost"].append(float(duals.get("fill_eps_cost", 0.0)))
-                agg["penalty_cost"].append(float(duals.get("penalty_cost", 0.0)))
-                agg["penalty_pax"].append(float(duals.get("penalty_pax", 0.0)))
-                agg["served_total"].append(float(duals.get("served_total", 0.0)))
-                agg["total_demand"].append(float(duals.get("total_demand", 0.0)))
 
             # Aggregate UB
             if ub_aggregation == "mean":
@@ -694,7 +893,9 @@ class ProblemSubproblem(Subproblem):
                 )
         else:
             # Single-demand case from params (prefer external file if given)
-            if params.get("demand_file"):
+            if single_scenario_override is not None:
+                R_out, R_ret = single_scenario_override
+            elif params.get("demand_file"):
                 R_out, R_ret = _load_demand_from_file(params.get("demand_file"), T)
             elif ("requests" in params) or ("req_matrix" in params) or ("R_out" in params) or ("R_ret" in params):
                 R_out, R_ret = _aggregate_requests(params, T)
@@ -715,6 +916,30 @@ class ProblemSubproblem(Subproblem):
             duals, ub_val = solve_subproblem(sp_params, C_out, C_ret, R_out, R_ret, candidate)
             t_solve1 = time.perf_counter()
             sp_solve_time = t_solve1 - t_solve0
+
+            # Early-exit if scalar theta is already consistent
+            theta_val = _cand_theta("__theta")
+            if (theta_val is not None) and _ok(theta_val, float(ub_val), eps_cut):
+                diagnostics = {
+                    "T": T,
+                    "R_out": [float(R_out[t]) for t in range(T)],
+                    "R_ret": [float(R_ret[t]) for t in range(T)],
+                    "pax_out_by_tau": list(duals.get("served_out_by_tau", [0.0] * T)),
+                    "pax_ret_by_tau": list(duals.get("served_ret_by_tau", [0.0] * T)),
+                    "pax_out_by_tau_k": list(duals.get("served_out_by_tau_k", [[] for _ in range(T)])),
+                    "pax_ret_by_tau_k": list(duals.get("served_ret_by_tau_k", [[] for _ in range(T)])),
+                    "objective_value": float(duals.get("objective_value", ub_val)),
+                    "waiting_cost_slots": float(duals.get("waiting_cost_slots", 0.0)),
+                    "fill_eps_cost": float(duals.get("fill_eps_cost", 0.0)),
+                    "penalty_cost": float(duals.get("penalty_cost", 0.0)),
+                    "penalty_pax": float(duals.get("penalty_pax", 0.0)),
+                    "served_total": float(duals.get("served_total", 0.0)),
+                    "total_demand": float(duals.get("total_demand", 0.0)),
+                    "slot_resolution": int(params.get("slot_resolution", 1)),
+                    "timing_sp_solve_s": sp_solve_time,
+                    "timing_cutgen_s": 0.0,
+                }
+                return SubproblemResult(is_feasible=True, upper_bound=ub_val, diagnostics=diagnostics)
 
             # Build coefficients via MW, duals (fast) or finite differences (fallback)
             t_cut0 = time.perf_counter()
@@ -985,20 +1210,21 @@ def solve_subproblem(
         res = solver.solve(m, tee=False, load_solutions=False)
         term = getattr(res.solver, "termination_condition", None)
         if term not in (pyo.TerminationCondition.optimal,):
-            try:
-                out_dir = Path("Report")
-                out_dir.mkdir(parents=True, exist_ok=True)
-                lp_path = out_dir / "subproblem_failed.lp"
-                m.write(str(lp_path), io_options={"symbolic_solver_labels": True})
-                print(f"[SP] Wrote LP: {lp_path}")
-                if candidate is not None:
-                    cand_path = out_dir / "subproblem_failed_candidate.txt"
-                    with cand_path.open("w", encoding="utf-8") as f:
-                        for k, v in sorted(candidate.items()):
-                            f.write(f"{k}={v}\n")
-                    print(f"[SP] Wrote candidate: {cand_path}")
-            except Exception:
-                pass
+            if not self._is_report():
+                try:
+                    out_dir = Path("Report")
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    lp_path = out_dir / "subproblem_failed.lp"
+                    m.write(str(lp_path), io_options={"symbolic_solver_labels": True})
+                    self._vprint(f"[SP] Wrote LP: {lp_path}")
+                    if candidate is not None:
+                        cand_path = out_dir / "subproblem_failed_candidate.txt"
+                        with cand_path.open("w", encoding="utf-8") as f:
+                            for k, v in sorted(candidate.items()):
+                                f.write(f"{k}={v}\n")
+                        self._vprint(f"[SP] Wrote candidate: {cand_path}")
+                except Exception:
+                    pass
             raise RuntimeError(f"Subproblem solve ambiguous: termination_condition={term}")
     # Load solution only after optimal termination
     try:
@@ -1108,36 +1334,37 @@ def solve_subproblem(
                 f"Strong duality check failed: primal={obj_val} dual={dual_obj}"
             )
     except Exception as exc:
-        try:
-            out_dir = Path("Report")
-            out_dir.mkdir(parents=True, exist_ok=True)
-            lp_path = out_dir / "subproblem_duality_failed.lp"
-            m.write(str(lp_path), io_options={"symbolic_solver_labels": True})
-            print(f"[SP] Wrote LP: {lp_path}")
-        except Exception:
-            pass
+        if not self._is_report():
+            try:
+                out_dir = Path("Report")
+                out_dir.mkdir(parents=True, exist_ok=True)
+                lp_path = out_dir / "subproblem_duality_failed.lp"
+                m.write(str(lp_path), io_options={"symbolic_solver_labels": True})
+                self._vprint(f"[SP] Wrote LP: {lp_path}")
+            except Exception:
+                pass
         raise
     sum_components = wait_cost_slots + fill_eps_cost + penalty_cost
     if abs(sum_components - obj_val) > 1e-5:
-        print(
+        self._vprint(
             "[SP DIAG] Objective mismatch: obj=%.6g wait=%.6g fill_eps=%.6g penalty=%.6g sum=%.6g"
             % (obj_val, wait_cost_slots, fill_eps_cost, penalty_cost, sum_components)
         )
         assert abs(sum_components - obj_val) <= 1e-5
     if wait_cost_slots < -1e-9:
         neg_contribs.sort(key=lambda x: x[0])
-        print("[SP DIAG] Negative waiting cost detected. Top negative contributions:")
+        self._vprint("[SP DIAG] Negative waiting cost detected. Top negative contributions:")
         for c, t, tau, k, val in neg_contribs[:10]:
-            print(f"  contrib={c:.6g} t={t} tau={tau} k={k} x={val:.6g}")
+            self._vprint(f"  contrib={c:.6g} t={t} tau={tau} k={k} x={val:.6g}")
         assert wait_cost_slots >= -1e-9
     if penalty_cost < -1e-9:
-        print(f"[SP DIAG] Negative penalty cost detected: {penalty_cost:.6g}")
+        self._vprint(f"[SP DIAG] Negative penalty cost detected: {penalty_cost:.6g}")
         assert penalty_cost >= -1e-9
     total_demand = float(sum(R_out) + sum(R_ret))
     served_total = float(sum(served_out_by_tau) + sum(served_ret_by_tau))
     # Consistency check: served + unmet == total demand (within tolerance)
     if abs((served_total + penalty_pax) - total_demand) > 1e-5:
-        print(
+        self._vprint(
             "[SP DIAG] Demand mismatch: total=%.6g served=%.6g unmet=%.6g"
             % (total_demand, served_total, penalty_pax)
         )

@@ -37,6 +37,13 @@ class ProblemMaster(MasterProblem):
             return default
         return self.params.get(key, default)
 
+    def _is_report(self) -> bool:
+        return str(self._p("log_level", "")).upper() == "REPORT"
+
+    def _vprint(self, *args, **kwargs) -> None:
+        if not self._is_report():
+            print(*args, **kwargs)
+
     def _extract_solver_stats(self, res) -> dict[str, Any]:
         stats: dict[str, Any] = {}
         try:
@@ -436,10 +443,10 @@ class ProblemMaster(MasterProblem):
                         except Exception:
                             pass
                 if n_out + n_ret > 0:
-                    print(f"[MIPSTART] x-only start applied: n_out={n_out} n_ret={n_ret}")
+                    self._vprint(f"[MIPSTART] x-only start applied: n_out={n_out} n_ret={n_ret}")
                     use_ws = True
                 else:
-                    print("[MIPSTART] no x vars found; skipping warm start")
+                    self._vprint("[MIPSTART] no x vars found; skipping warm start")
             except Exception:
                 use_ws = False
             finally:
@@ -476,56 +483,57 @@ class ProblemMaster(MasterProblem):
                             m.yRET[q, t].value = pv
                             n_ret += 1
                 if n_out + n_ret > 0:
-                    print(f"[MIPSTART] x-only start applied: n_out={n_out} n_ret={n_ret}")
+                    self._vprint(f"[MIPSTART] x-only start applied: n_out={n_out} n_ret={n_ret}")
                     use_ws = True
                 else:
-                    print("[MIPSTART] no x vars found; skipping warm start")
+                    self._vprint("[MIPSTART] no x vars found; skipping warm start")
             except Exception:
                 use_ws = False
         # Diagnostics: write LP and enable solver logs
-        try:
-            out_dir = Path(self._p("lp_output_dir", "Report"))
-            out_dir.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            try:
-                it = int(self._p("iteration", -1))
-            except Exception:
-                it = -1
-            cuts = int(self._cut_idx)
-            if it >= 0:
-                lp_path = out_dir / f"master_iter_{it:03d}_cuts_{cuts:03d}_{ts}.lp"
-            else:
-                lp_path = out_dir / f"master_iter_cuts_{cuts:03d}_{ts}.lp"
-            m.write(str(lp_path), io_options={"symbolic_solver_labels": True})
-            print(f"[MP] Wrote LP: {lp_path}")
-        except Exception:
-            lp_path = None
-
         log_path = None
-        try:
-            out_dir = Path(self._p("lp_output_dir", "Report"))
-            out_dir.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if emit_reports:
             try:
-                it = int(self._p("iteration", -1))
-            except Exception:
-                it = -1
-            cuts = int(self._cut_idx)
-            if it >= 0:
-                log_path = out_dir / f"master_iter_{it:03d}_cuts_{cuts:03d}_{ts}.log"
-            else:
-                log_path = out_dir / f"master_iter_cuts_{cuts:03d}_{ts}.log"
-            backend = str(self._p("solver_backend", "")).lower()
-            if backend in ("cplex", ""):
-                solver.options["logfile"] = str(log_path)
-            else:
-                # cplex_direct: set internal log file attribute if available
+                out_dir = Path(self._p("lp_output_dir", "Report"))
+                out_dir.mkdir(parents=True, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 try:
-                    setattr(solver, "_log_file", str(log_path))
+                    it = int(self._p("iteration", -1))
                 except Exception:
-                    pass
-        except Exception:
-            log_path = None
+                    it = -1
+                cuts = int(self._cut_idx)
+                if it >= 0:
+                    lp_path = out_dir / f"master_iter_{it:03d}_cuts_{cuts:03d}_{ts}.lp"
+                else:
+                    lp_path = out_dir / f"master_iter_cuts_{cuts:03d}_{ts}.lp"
+                m.write(str(lp_path), io_options={"symbolic_solver_labels": True})
+                self._vprint(f"[MP] Wrote LP: {lp_path}")
+            except Exception:
+                lp_path = None
+
+            try:
+                out_dir = Path(self._p("lp_output_dir", "Report"))
+                out_dir.mkdir(parents=True, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                try:
+                    it = int(self._p("iteration", -1))
+                except Exception:
+                    it = -1
+                cuts = int(self._cut_idx)
+                if it >= 0:
+                    log_path = out_dir / f"master_iter_{it:03d}_cuts_{cuts:03d}_{ts}.log"
+                else:
+                    log_path = out_dir / f"master_iter_cuts_{cuts:03d}_{ts}.log"
+                backend = str(self._p("solver_backend", "")).lower()
+                if backend in ("cplex", ""):
+                    solver.options["logfile"] = str(log_path)
+                else:
+                    # cplex_direct: set internal log file attribute if available
+                    try:
+                        setattr(solver, "_log_file", str(log_path))
+                    except Exception:
+                        pass
+            except Exception:
+                log_path = None
         self._last_log_path = str(log_path) if log_path is not None else None
 
         res = solver.solve(
@@ -586,7 +594,7 @@ class ProblemMaster(MasterProblem):
                     symbolic_solver_labels=True,
                 )
                 term = getattr(res.solver, "termination_condition", None)
-                print("[MP] Fallback to cplex_direct due to UNKNOWN termination.")
+                self._vprint("[MP] Fallback to cplex_direct due to UNKNOWN termination.")
             except Exception:
                 pass
         try:
@@ -654,7 +662,7 @@ class ProblemMaster(MasterProblem):
             else:
                 stats["best_bound_reason"] = "not_in_solver_or_log"
 
-        print(
+        self._vprint(
             "MP raw solver: status=%s term=%s incumbent=%s best_bound=%s"
             % (
                 str(st),
@@ -664,7 +672,7 @@ class ProblemMaster(MasterProblem):
             )
         )
         if parsed_best_int is not None or parsed_best_bound is not None:
-            print(
+            self._vprint(
                 "MP parsed bounds: best_integer=%s best_bound=%s"
                 % (
                     (f"{float(parsed_best_int):.6g}" if parsed_best_int is not None else "-"),
@@ -674,11 +682,11 @@ class ProblemMaster(MasterProblem):
         try:
             sol_len = len(getattr(res, "solution", []))
             sol_keys = list(getattr(res, "solution", {}).keys()) if hasattr(res, "solution") else []
-            print(f"MP solutions: count={sol_len} keys={sol_keys}")
+            self._vprint(f"MP solutions: count={sol_len} keys={sol_keys}")
         except Exception:
             pass
         if log_path is not None:
-            print(f"[MP] Solver log: {log_path}")
+            self._vprint(f"[MP] Solver log: {log_path}")
         if term in (pyo.TerminationCondition.optimal,):
             status = SolveStatus.OPTIMAL
         elif term in (pyo.TerminationCondition.feasible, pyo.TerminationCondition.maxTimeLimit):
@@ -744,7 +752,7 @@ class ProblemMaster(MasterProblem):
                     if nonzero:
                         break
                 if not nonzero:
-                    print("[WARN] Master has cuts but all y are zero.")
+                    self._vprint("[WARN] Master has cuts but all y are zero.")
         except Exception:
             pass
         self._last_solve_stats = stats
@@ -754,7 +762,7 @@ class ProblemMaster(MasterProblem):
             for q in m.Q:
                 tot_q = sum(float(m.yOUT[q, t].value or 0.0) + float(m.yRET[q, t].value or 0.0) for t in m.T)
                 totals.append(tot_q)
-            print("Shuttle totals (OUT+RET): " + ", ".join(f"q{idx}={tot:.0f}" for idx, tot in enumerate(totals)))
+            self._vprint("Shuttle totals (OUT+RET): " + ", ".join(f"q{idx}={tot:.0f}" for idx, tot in enumerate(totals)))
         except Exception:
             pass
         # Store solution values for next MIP start (binary vars)
@@ -777,7 +785,7 @@ class ProblemMaster(MasterProblem):
             incumbent = stats.get("incumbent")
             gap = stats.get("gap")
             if nodes is not None or best_bound is not None or incumbent is not None or gap is not None:
-                print(
+                self._vprint(
                     "MP stats (solver): nodes=%s best_bound=%s incumbent=%s gap=%s"
                     % (str(nodes), str(best_bound), str(incumbent), str(gap))
                 )
@@ -825,6 +833,29 @@ class ProblemMaster(MasterProblem):
                 "Non-binary master solution; refusing SP evaluation. Offenders: "
                 + ", ".join(f"{k}={v:.6g}" for k, v in top)
             )
+        # Include theta values (if available) for early-exit checks in subproblem
+        try:
+            if hasattr(m, "theta"):
+                val = pyo.value(m.theta, exception=False)
+                if val is not None:
+                    cand["__theta"] = float(val)
+        except Exception:
+            pass
+        try:
+            if hasattr(m, "theta_s"):
+                try:
+                    S = len(getattr(m, "Scenarios", []))
+                except Exception:
+                    S = 0
+                for s in range(int(S)):
+                    try:
+                        v = pyo.value(m.theta_s[s], exception=False)
+                    except Exception:
+                        v = None
+                    if v is not None:
+                        cand[f"__theta_s[{int(s)}]"] = float(v)
+        except Exception:
+            pass
         return cand
 
     # Pretty-print the current master solution (if solved)
@@ -1109,15 +1140,15 @@ class ProblemMaster(MasterProblem):
             # Tightness + violation checks
             eps_cut = float(self._p("eps_cut", 1e-8))
             if ub_est_out is not None and abs(rhs_out_val - float(ub_est_out)) > eps_cut * max(1.0, abs(float(ub_est_out))):
-                print("[CUT DEBUG] Tightness failed (OUT). ub=%.6g rhs=%.6g" % (float(ub_est_out), rhs_out_val))
+                self._vprint("[CUT DEBUG] Tightness failed (OUT). ub=%.6g rhs=%.6g" % (float(ub_est_out), rhs_out_val))
                 return False
             if ub_est_ret is not None and abs(rhs_ret_val - float(ub_est_ret)) > eps_cut * max(1.0, abs(float(ub_est_ret))):
-                print("[CUT DEBUG] Tightness failed (RET). ub=%.6g rhs=%.6g" % (float(ub_est_ret), rhs_ret_val))
+                self._vprint("[CUT DEBUG] Tightness failed (RET). ub=%.6g rhs=%.6g" % (float(ub_est_ret), rhs_ret_val))
                 return False
             viol_out = rhs_out_val - lhs_out_val
             viol_ret = rhs_ret_val - lhs_ret_val
             if (viol_out <= eps_cut * max(1.0, abs(rhs_out_val))) and (viol_ret <= eps_cut * max(1.0, abs(rhs_ret_val))):
-                print("[CUT DEBUG] Not violated (dir). viol_out=%.6g viol_ret=%.6g" % (viol_out, viol_ret))
+                self._vprint("[CUT DEBUG] Not violated (dir). viol_out=%.6g viol_ret=%.6g" % (viol_out, viol_ret))
                 return False
             if aggregate:
                 slopes_out = {("Yout", int(t)): float(v) for t, v in agg_out.items()}
@@ -1170,11 +1201,11 @@ class ProblemMaster(MasterProblem):
             # Tightness + violation checks
             eps_cut = float(self._p("eps_cut", 1e-8))
             if abs(rhs_val - float(ub_est)) > eps_cut * max(1.0, abs(float(ub_est))):
-                print("[CUT DEBUG] Tightness failed. ub=%.6g rhs=%.6g" % (float(ub_est), rhs_val))
+                self._vprint("[CUT DEBUG] Tightness failed. ub=%.6g rhs=%.6g" % (float(ub_est), rhs_val))
                 return False
             viol = rhs_val - lhs_val
             if viol <= eps_cut * max(1.0, abs(rhs_val)):
-                print("[CUT DEBUG] Not violated. viol=%.6g" % (viol,))
+                self._vprint("[CUT DEBUG] Not violated. viol=%.6g" % (viol,))
                 return False
             if aggregate:
                 slopes_all = {("Yout", int(t)): float(v) for t, v in agg_out.items()}
@@ -1255,7 +1286,7 @@ class ProblemMaster(MasterProblem):
 
         # Optional: export MP LP after adding a cut for inspection
         try:
-            if bool(self._p("write_lp_after_cut", False)):
+            if bool(self._p("write_lp_after_cut", False)) and (not self._is_report()):
                 out_dir = Path(self._p("lp_output_dir", "Report"))
                 out_dir.mkdir(parents=True, exist_ok=True)
                 lp_path = out_dir / f"master_after_cut_{self._cut_idx}.lp"
@@ -1267,12 +1298,12 @@ class ProblemMaster(MasterProblem):
                 except Exception:
                     wrote = False
                 if wrote:
-                    print(f"[BENDERS] Wrote LP to {lp_path}")
+                    self._vprint(f"[BENDERS] Wrote LP to {lp_path}")
                 # Also write a symbolic LP via Pyomo for readability
                 try:
                     sym_lp_path = out_dir / f"master_after_cut_{self._cut_idx}_sym.lp"
                     m.write(str(sym_lp_path), io_options={"symbolic_solver_labels": True})
-                    print(f"[BENDERS] Wrote symbolic LP to {sym_lp_path}")
+                    self._vprint(f"[BENDERS] Wrote symbolic LP to {sym_lp_path}")
                 except Exception:
                     pass
         except Exception:
@@ -1285,35 +1316,40 @@ class ProblemMaster(MasterProblem):
         if all_betas:
             rng = (min(all_betas), max(all_betas))
             if hasattr(m, "theta_out") and hasattr(m, "theta_ret") and (const_adj_out is not None) and (const_adj_ret is not None):
-                print(
+                self._vprint(
                     f"[BENDERS] Added cut #{self._cut_idx}: const_out={const_adj_out:.6g}, const_ret={const_adj_ret:.6g}, nnz={nnz}, slope_range=[{rng[0]:.3g},{rng[1]:.3g}], raw_pos_dm={raw_pos_dm}, scale={scale:.3g}"
                 )
             else:
-                print(
+                self._vprint(
                     f"[BENDERS] Added cut #{self._cut_idx}: const={const_adj:.6g}, nnz={nnz}, slope_range=[{rng[0]:.3g},{rng[1]:.3g}], raw_pos_dm={raw_pos_dm}, scale={scale:.3g}"
                 )
         else:
             if hasattr(m, "theta_out") and hasattr(m, "theta_ret") and (const_adj_out is not None) and (const_adj_ret is not None):
-                print(
+                self._vprint(
                     f"[BENDERS] Added cut #{self._cut_idx}: const_out={const_adj_out:.6g}, const_ret={const_adj_ret:.6g}, nnz={nnz}, raw_pos_dm={raw_pos_dm}, scale={scale:.3g}"
                 )
             else:
-                print(f"[BENDERS] Added cut #{self._cut_idx}: const={const_adj:.6g}, nnz={nnz}, raw_pos_dm={raw_pos_dm}, scale={scale:.3g}")
+                self._vprint(f"[BENDERS] Added cut #{self._cut_idx}: const={const_adj:.6g}, nnz={nnz}, raw_pos_dm={raw_pos_dm}, scale={scale:.3g}")
         # Sanity log with LHS and RHS values (scaled)
         try:
             if hasattr(m, "theta_out") and hasattr(m, "theta_ret") and (const_adj_out is not None) and (const_adj_ret is not None):
-                print(
+                self._vprint(
                     f"[BENDERS] Eval cut (dir): OUT lhs={lhs_out_val:.6g} rhs={rhs_out_val:.6g}; "
                     f"RET lhs={lhs_ret_val:.6g} rhs={rhs_ret_val:.6g}"
                 )
             else:
-                print(f"[BENDERS] Eval cut: lhs={lhs_val:.6g} rhs={rhs_val:.6g}")
+                self._vprint(f"[BENDERS] Eval cut: lhs={lhs_val:.6g} rhs={rhs_val:.6g}")
         except Exception:
             pass
         self._cut_idx += 1
         # Track last cut info for cross-iteration checks
         self._last_cut_const = (const_adj_out + const_adj_ret) if (const_adj_out is not None and const_adj_ret is not None) else const_adj
         self._last_cut_nnz = nnz
+        try:
+            ct = cut.cut_type
+            self._last_cut_type = ct.value if hasattr(ct, "value") else str(ct)
+        except Exception:
+            self._last_cut_type = None
         return True
 
     # Evaluate deterministic first-stage cost f(y) for a given candidate
@@ -1395,4 +1431,7 @@ class ProblemMaster(MasterProblem):
 
     def last_cut_info(self) -> tuple[float | None, int | None]:
         return getattr(self, "_last_cut_const", None), getattr(self, "_last_cut_nnz", None)
+
+    def last_cut_meta(self) -> tuple[str | None, int | None]:
+        return getattr(self, "_last_cut_type", None), getattr(self, "_last_cut_nnz", None)
 

@@ -103,6 +103,8 @@ def _prepare_params(cfg, overrides: dict | None) -> tuple[dict, dict]:
 
     mp["solver"] = cfg.solver.master_solver
     mp["solver_tee"] = bool(cfg.solver.solver_tee)
+    mp["log_level"] = str(cfg.run.log_level)
+    mp["emit_reports"] = str(cfg.run.log_level).upper() != "REPORT"
 
     sp["lp_solver"] = cfg.solver.subproblem_solver
     sp["multi_cuts_by_scenario"] = bool(cfg.subproblem.multi_cuts_by_scenario)
@@ -127,6 +129,7 @@ def _prepare_params(cfg, overrides: dict | None) -> tuple[dict, dict]:
     _set_if_not_none(sp, "scenarios", cfg.data.scenarios)
 
     sp["slot_resolution"] = int(time.slot_resolution)
+    sp["log_level"] = str(cfg.run.log_level)
 
     if overrides:
         mp.update((overrides.get("master_params") or {}) if isinstance(overrides, dict) else {})
@@ -358,6 +361,7 @@ def run(config_path: str | Path | None = None, overrides: dict | None = None) ->
     cfg = load_config(config_path)
     _apply_run_overrides(cfg, overrides)
     setup_logging(cfg.run.log_level)
+    report_mode = str(cfg.run.log_level).upper() == "REPORT"
 
     mp_base, sp_base = _prepare_params(cfg, overrides)
     emit_cli_output = bool(overrides.get("emit_cli_output")) if overrides else False
@@ -389,12 +393,14 @@ def run(config_path: str | Path | None = None, overrides: dict | None = None) ->
                 except Exception:
                     pass
             if emit_cli_output:
-                print(f"\n=== Multi-res stage {i}/{len(seq)}: slot_resolution={res} ===")
+                if not report_mode:
+                    print(f"\n=== Multi-res stage {i}/{len(seq)}: slot_resolution={res} ===")
             warm_start = None
             if prev_cand is not None and prev_res is not None:
                 warm_start = _map_candidate_to_warm_start(prev_cand, prev_res, int(res), mp)
                 if emit_cli_output and warm_start:
-                    print(f"Applied warm start with {len(warm_start)} start(s).")
+                    if not report_mode:
+                        print(f"Applied warm start with {len(warm_start)} start(s).")
             result, master = _run_single(
                 cfg,
                 mp,
@@ -405,10 +411,11 @@ def run(config_path: str | Path | None = None, overrides: dict | None = None) ->
             )
             last_result = result
             if emit_cli_output:
-                print(
-                    f"Stage {i} result: status={result.status} iters={result.iterations} "
-                    f"LB={result.best_lower_bound} UB={result.best_upper_bound}"
-                )
+                if not report_mode:
+                    print(
+                        f"Stage {i} result: status={result.status} iters={result.iterations} "
+                        f"LB={result.best_lower_bound} UB={result.best_upper_bound}"
+                    )
             try:
                 prev_cand = getattr(master, "_collect_candidate")()
                 prev_res = int(res)

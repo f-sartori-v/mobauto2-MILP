@@ -15,9 +15,9 @@ run:
 
 data:
   # Demand source (preferred): file with requests or R_out/R_ret arrays
-  demand_file: setups/random.yaml
+  demand_file: setups/nice15.yaml
   # Optional scenario files for multi-scenario runs
-  scenario_files: []
+  scenario_files: #[setups/rtime1.yaml, setups/rtime2.yaml, setups/rtime3.yaml, setups/rtime4.yaml, setups/rtime5.yaml]
   # Optional weights aligned with scenario_files
   scenario_weights: null
   # Optional inline demand arrays (single scenario)
@@ -34,7 +34,7 @@ model:
     trip_duration_minutes: 30
   fleet:
     # Number of shuttles
-    Q: 3
+    Q: 2
     # Initial battery per shuttle (length Q)
     binit: [150.0, 150.0, 150.0, 150.0, 150.0, 150.0, 150.0]
   energy:
@@ -70,7 +70,7 @@ master:
   # Stronger aggregated cuts by tau
   aggregate_cuts_by_tau: true
   # Use one theta per scenario (requires multi-cuts)
-  theta_per_scenario: true
+  theta_per_scenario: false
   # Drop tiny cut coefficients to improve numerics
   cut_coeff_threshold: 0.001
   # Debug: write LP after each new cut
@@ -84,7 +84,7 @@ subproblem:
   # Core-point mixing factor alpha in (0,1]
   mw_core_alpha: 0.3
   # Use dual slopes for cut generation
-  use_dual_slopes: false
+  use_dual_slopes: true
   # Capacity units contributed by one vehicle starting at time tau
   S: 15
   # Max waiting time in minutes or slots
@@ -100,7 +100,7 @@ solver:
   # Benders loop settings
   max_iterations: 100
   tolerance: 0.001
-  time_limit_s: 300
+  time_limit_s: 600
   # Optional stall-based early stopping
   stall_max_no_improve_iters: 0
   stall_min_abs_improve: 1.0

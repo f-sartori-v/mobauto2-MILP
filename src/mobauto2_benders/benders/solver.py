@@ -258,6 +258,80 @@ class BendersRunResult:
     sp_slot_resolution: Optional[int] = None
 
 
+@dataclass(slots=True)
+class IterReport:
+    k: int
+    best_lb: Optional[float] = None
+    best_ub: Optional[float] = None
+    gap_abs: Optional[float] = None
+    gap_rel_pct: Optional[float] = None
+    mp_status: Optional[str] = None
+    mp_obj: Optional[float] = None
+    mp_best_bound: Optional[float] = None
+    mp_gap_pct: Optional[float] = None
+    mp_nodes: Optional[float] = None
+    sp_feasible: Optional[bool] = None
+    sp_recourse: Optional[float] = None
+    candidate_ub: Optional[float] = None
+    pax_served: Optional[float] = None
+    pax_total: Optional[float] = None
+    penalty_pax: Optional[float] = None
+    avg_wait_min: Optional[float] = None
+    cuts_added: Optional[int] = None
+    cuts_total: Optional[int] = None
+    last_cut_type: Optional[str] = None
+    last_cut_nnz: Optional[int] = None
+    t_master_s: Optional[float] = None
+    t_sp_solve_s: Optional[float] = None
+    t_cutgen_s: Optional[float] = None
+    t_iter_s: Optional[float] = None
+
+
+def _fmt_float(val: Optional[float], digits: int) -> str:
+    if val is None:
+        return "NA"
+    try:
+        return f"{float(val):.{digits}f}"
+    except Exception:
+        return "NA"
+
+
+def _fmt_int(val: Optional[float | int]) -> str:
+    if val is None:
+        return "NA"
+    try:
+        return str(int(val))
+    except Exception:
+        return "NA"
+
+
+def format_report_line(rep: IterReport) -> str:
+    if rep.best_lb is not None and rep.best_ub is not None:
+        gap_abs = abs(float(rep.best_ub) - float(rep.best_lb))
+        gap_rel = gap_abs / max(1.0, abs(float(rep.best_ub)))
+        rep.gap_abs = gap_abs
+        rep.gap_rel_pct = 100.0 * gap_rel
+    served = "NA"
+    if rep.pax_served is not None and rep.pax_total is not None:
+        try:
+            served = f"{float(rep.pax_served):.0f}/{float(rep.pax_total):.0f}"
+        except Exception:
+            served = "NA"
+    feas = "NA" if rep.sp_feasible is None else str(bool(rep.sp_feasible))
+    return (
+        f"k={rep.k} | "
+        f"BND LB={_fmt_float(rep.best_lb, 2)} UB={_fmt_float(rep.best_ub, 2)} "
+        f"gap={_fmt_float(rep.gap_abs, 2)} rel={_fmt_float(rep.gap_rel_pct, 2)}% | "
+        f"MP st={rep.mp_status or 'NA'} obj={_fmt_float(rep.mp_obj, 2)} bd={_fmt_float(rep.mp_best_bound, 2)} "
+        f"gap={_fmt_float(rep.mp_gap_pct, 2)}% nodes={_fmt_int(rep.mp_nodes)} | "
+        f"SP feas={feas} rec={_fmt_float(rep.sp_recourse, 2)} ub={_fmt_float(rep.candidate_ub, 2)} "
+        f"served={served} pen={_fmt_float(rep.penalty_pax, 2)} avgW={_fmt_float(rep.avg_wait_min, 2)} | "
+        f"CUT add={_fmt_int(rep.cuts_added)} tot={_fmt_int(rep.cuts_total)} "
+        f"type={rep.last_cut_type or 'NA'} nnz={_fmt_int(rep.last_cut_nnz)} | "
+        f"TIME mp={_fmt_float(rep.t_master_s, 3)} sp={_fmt_float(rep.t_sp_solve_s, 3)} "
+        f"cut={_fmt_float(rep.t_cutgen_s, 3)} it={_fmt_float(rep.t_iter_s, 3)}"
+    )
+
 class BendersSolver:
     def __init__(self, master: MasterProblem, subproblem: Subproblem, cfg: RootConfig):
         self.master = master
@@ -270,10 +344,14 @@ class BendersSolver:
     def run(self) -> BendersRunResult:
         t0 = time.time()
         set_cut_tolerances(self.cfg.tolerances.eps_cut, self.cfg.tolerances.eps_hash)
+        report_mode = str(self.cfg.run.log_level).upper() == "REPORT"
+        def _vprint(*args, **kwargs) -> None:
+            if not report_mode:
+                print(*args, **kwargs)
         max_it = self.cfg.solver.max_iterations
         tol = self.cfg.solver.tolerance
         self.master.initialize()
-        print("Initialized master problem.")
+        _vprint("Initialized master problem.")
 
         total_master_time = 0.0
         total_sp_solve_time = 0.0
@@ -301,7 +379,7 @@ class BendersSolver:
             mw_alpha = 0.10
         if mw_eps <= 0.0:
             mw_eps = 1e-3
-        print(f"[MW] enabled={mw_enabled} alpha={mw_alpha:.3g} eps={mw_eps:.3g}")
+        _vprint(f"[MW] enabled={mw_enabled} alpha={mw_alpha:.3g} eps={mw_eps:.3g}")
 
         def _calc_pax_totals_from_diag(diag: dict | None) -> tuple[Optional[float], Optional[float]]:
             if not isinstance(diag, dict):
@@ -548,6 +626,8 @@ class BendersSolver:
                 sp_slot_resolution=extra.get("sp_slot_resolution"),
             )
         for it in range(1, max_it + 1):
+            iter_t0 = time.perf_counter()
+            rep = IterReport(k=it)
             lb_before_iter = best_lb
             ub_before_iter = best_ub
             if time.time() - t0 > self.cfg.solver.time_limit_s:
@@ -609,8 +689,8 @@ class BendersSolver:
                     pass
                 return _make_result(SolveStatus.UNKNOWN, it - 1)
 
-            print(f"\n=== Iteration {it} ===")
-            print("Solving Master (MP)...")
+            _vprint(f"\n=== Iteration {it} ===")
+            _vprint("Solving Master (MP)...")
             try:
                 if isinstance(getattr(self.master, "params", None), dict):
                     self.master.params["iteration"] = int(it)
@@ -631,7 +711,7 @@ class BendersSolver:
                             mg = min(cur_gap, 0.01)
                         self.master.params["solve_time_limit_s"] = tl
                         self.master.params["mipgap"] = mg
-                        print(f"[TIGHTEN] no new cuts for {no_cut_streak} iters: time_limit_s={tl:.0f} mipgap={mg:.3g}")
+                        _vprint(f"[TIGHTEN] no new cuts for {no_cut_streak} iters: time_limit_s={tl:.0f} mipgap={mg:.3g}")
                 except Exception:
                     pass
             # Dynamic master solve schedule based on current global BD gap
@@ -650,7 +730,7 @@ class BendersSolver:
                     if isinstance(getattr(self.master, "params", None), dict):
                         self.master.params["solve_time_limit_s"] = mp_tl
                         self.master.params["mipgap"] = mp_gap
-                    print(f"[SCHEDULE] master gap-tied: time_limit_s={mp_tl:.0f} mipgap={mp_gap:.2g} g_bd={g_bd:.3g}")
+                    _vprint(f"[SCHEDULE] master gap-tied: time_limit_s={mp_tl:.0f} mipgap={mp_gap:.2g} g_bd={g_bd:.3g}")
                 except Exception:
                     pass
             mp_t0 = time.perf_counter()
@@ -665,7 +745,7 @@ class BendersSolver:
                 f"{mres.objective:.6g}" if mres.objective is not None else None,
                 f"{mres.lower_bound:.6g}" if mres.lower_bound is not None else None,
             )
-            print(
+            _vprint(
                 "MP result: status=%s obj=%s lb=%s"
                 % (
                     mres.status,
@@ -803,7 +883,7 @@ class BendersSolver:
                     gap_source = "computed"
                 except Exception:
                     pass
-            print(
+            _vprint(
                 "[CHECK] MP: first=%.6g theta=%.6g mp_total=%.6g inc_obj=%s best_bound=%s"
                 % (
                     float(first_stage_cost_inc),
@@ -813,7 +893,7 @@ class BendersSolver:
                     (f"{float(mp_best_bound):.6g}" if mp_best_bound is not None else "-"),
                 )
             )
-            print(
+            _vprint(
                 "[CHECK] MP bounds: mp_obj=%s mp_best_bound=%s mp_best_integer=%s term=%s status=%s gap=%s"
                 % (
                     (f"{mp_inc_obj:.6g}" if mp_inc_obj is not None else "-"),
@@ -829,7 +909,7 @@ class BendersSolver:
             except Exception:
                 last_mp_gap = None
             last_mp_term = str(mp_term) if mp_term is not None else None
-            print(
+            _vprint(
                 "[MP] iter=%d incumbent=%s best_bound=%s gap=%s (src: inc=%s bb=%s gap=%s)"
                 % (
                     it,
@@ -842,6 +922,17 @@ class BendersSolver:
                 )
             )
 
+            try:
+                stats_nodes = stats.get("nodes") if isinstance(stats, dict) else None
+            except Exception:
+                stats_nodes = None
+            rep.t_master_s = mp_time
+            rep.mp_status = str(mp_status) if mp_status is not None else None
+            rep.mp_obj = mp_inc_obj
+            rep.mp_best_bound = float(mp_best_bound) if mp_best_bound is not None else None
+            rep.mp_gap_pct = (float(mp_gap) * 100.0) if mp_gap is not None else None
+            rep.mp_nodes = stats_nodes
+
             # Instrumentation: per-iteration summary
             try:
                 cuts_in_model = getattr(self.master, "cuts_count", lambda: None)()
@@ -853,7 +944,7 @@ class BendersSolver:
             except Exception:
                 pass
             if mres.objective is not None:
-                print(
+                _vprint(
                     f"[MP] iter={it} cuts={cuts_in_model if cuts_in_model is not None else '-'} obj={mres.objective:.3f}"
                     + (f" last_const={last_const:.3f} last_nnz={last_nnz}" if last_const is not None else "")
                 )
@@ -882,17 +973,29 @@ class BendersSolver:
             else:
                 reason = f" reason={bb_reason}" if bb_reason is not None else ""
                 log.warning("[CHECK] MP best bound unavailable; LB not updated.%s", reason)
-                print(f"[MP] best_bound unavailable{reason}")
+                _vprint(f"[MP] best_bound unavailable{reason}")
+            if mp_best_bound is not None:
+                rep.mp_best_bound = float(mp_best_bound)
 
             if not mres.candidate:
                 log.error("Master did not return a candidate solution")
-                print("Master did not return a usable incumbent; skipping SP and increasing MP time limit.")
+                _vprint("Master did not return a usable incumbent; skipping SP and increasing MP time limit.")
                 try:
                     if isinstance(getattr(self.master, "params", None), dict):
                         cur_tl = float(self.master.params.get("solve_time_limit_s", 0) or 0)
                         self.master.params["solve_time_limit_s"] = max(cur_tl, 10.0)
                 except Exception:
                     pass
+                try:
+                    rep.cuts_added = 0
+                    rep.cuts_total = getattr(self.master, "cuts_count", lambda: None)()
+                except Exception:
+                    rep.cuts_total = None
+                rep.best_lb = best_lb
+                rep.best_ub = best_ub
+                rep.t_iter_s = time.perf_counter() - iter_t0
+                if report_mode:
+                    print(format_report_line(rep))
                 continue
 
             # Optional: update and pass a core point for Magnanti–Wong selection
@@ -974,7 +1077,7 @@ class BendersSolver:
                             vmin = min(vals)
                             vmax = max(vals)
                             vmean = sum(vals) / float(len(vals))
-                            print(f"[MW] core updated (t=0..): min={vmin:.3g} max={vmax:.3g} mean={vmean:.3g}")
+                            _vprint(f"[MW] core updated (t=0..): min={vmin:.3g} max={vmax:.3g} mean={vmean:.3g}")
                     except Exception:
                         pass
 
@@ -992,7 +1095,7 @@ class BendersSolver:
                 except Exception:
                     pass
 
-            print("Evaluating Subproblem (SP) at candidate...")
+            _vprint("Evaluating Subproblem (SP) at candidate...")
             sp_t0 = time.perf_counter()
             sres: SubproblemResult = self.subproblem.evaluate(mres.candidate)
             sp_t1 = time.perf_counter()
@@ -1017,14 +1120,36 @@ class BendersSolver:
                 last_diag = dict(getattr(sres, "diagnostics", {}) or {})
             except Exception:
                 last_diag = None
+            rep.sp_feasible = bool(sres.is_feasible) if sres.is_feasible is not None else None
+            rep.sp_recourse = sp_recourse_obj
+            rep.candidate_ub = sp_total_obj
+            try:
+                served, total = _calc_pax_totals_from_diag(last_diag)
+            except Exception:
+                served, total = (None, None)
+            rep.pax_served = served
+            rep.pax_total = total
+            try:
+                pen_pax = last_diag.get("penalty_pax") if isinstance(last_diag, dict) else None
+                rep.penalty_pax = float(pen_pax) if pen_pax is not None else None
+            except Exception:
+                rep.penalty_pax = None
+            try:
+                wait_slots = last_diag.get("waiting_cost_slots") if isinstance(last_diag, dict) else None
+                slot_res = last_diag.get("slot_resolution") if isinstance(last_diag, dict) else None
+                if wait_slots is not None and rep.pax_served and rep.pax_served > 0:
+                    res = int(slot_res or 1)
+                    rep.avg_wait_min = (float(wait_slots) * float(res)) / float(rep.pax_served)
+            except Exception:
+                rep.avg_wait_min = None
             try:
                 _ub_print = f"{sres.upper_bound:.6g}" if sres.upper_bound is not None else "-"
             except Exception:
                 _ub_print = "-"
             # Clarify that SP result is recourse-only
-            print(f"SP result: recourse={_ub_print} feasible={sres.is_feasible}")
+            _vprint(f"SP result: recourse={_ub_print} feasible={sres.is_feasible}")
             if sp_recourse_obj is not None:
-                print(
+                _vprint(
                     "[CHECK] SP: recourse=%.6g first=%.6g sp_total=%.6g"
                     % (
                         float(sp_recourse_obj),
@@ -1089,7 +1214,7 @@ class BendersSolver:
                         for (q, tau), v in coeff_yret.items():
                             line_val += float(v) * _cand_val("yRET", int(q), int(tau))
                     diff = float(line_val) - float(sres.upper_bound)
-                    print(
+                    _vprint(
                         f"[CUT TIGHTNESS] line(y)={line_val:.6g}  SP_ub={float(sres.upper_bound):.6g}  diff={diff:.3g}"
                     )
             except Exception:
@@ -1148,12 +1273,21 @@ class BendersSolver:
             if added > 0:
                 log.info("added %d cut(s)", added)
                 names_str = ", ".join(cut_names) if cut_names else "(unnamed)"
-                print(f"Master updated: added {added} cut(s): {names_str}")
+                _vprint(f"Master updated: added {added} cut(s): {names_str}")
                 no_cut_streak = 0
             else:
                 if cut_names:
-                    print("Master updated: no new cuts (all skipped / duplicates)")
+                    _vprint("Master updated: no new cuts (all skipped / duplicates)")
                 no_cut_streak += 1
+            rep.cuts_added = added
+            rep.cuts_total = cuts_after
+            if added > 0:
+                try:
+                    last_cut_type, last_cut_nnz = getattr(self.master, "last_cut_meta", lambda: (None, None))()
+                except Exception:
+                    last_cut_type, last_cut_nnz = (None, None)
+                rep.last_cut_type = last_cut_type
+                rep.last_cut_nnz = last_cut_nnz
             # Invariant: first iteration with finite SP UB must add at least one cut
             if (
                 it == 1
@@ -1195,6 +1329,8 @@ class BendersSolver:
             total_cutgen_time += float(cutgen_time)
 
             total_iter += 1
+            rep.t_sp_solve_s = float(sp_solve_time) if sp_solve_time is not None else None
+            rep.t_cutgen_s = float(cutgen_time) if cutgen_time is not None else None
 
             # Per-iteration timing + stats
             stats = {}
@@ -1206,7 +1342,7 @@ class BendersSolver:
             gap = stats.get("gap")
             best_bound = stats.get("best_bound")
             incumbent = stats.get("incumbent")
-            print(
+            _vprint(
                 "Timing: master=%.3fs sp_solve=%.3fs cutgen=%.3fs cutadd=%.3fs cuts_added=%s total_cuts=%s"
                 % (
                     mp_time,
@@ -1218,7 +1354,7 @@ class BendersSolver:
                 )
             )
             if nodes is not None or best_bound is not None or incumbent is not None or gap is not None:
-                print(
+                _vprint(
                     "MP stats: nodes=%s best_bound=%s incumbent=%s gap=%s"
                     % (
                         str(nodes),
@@ -1228,6 +1364,12 @@ class BendersSolver:
                     )
                 )
 
+            rep.best_lb = best_lb
+            rep.best_ub = best_ub
+            rep.t_iter_s = time.perf_counter() - iter_t0
+            if report_mode:
+                print(format_report_line(rep))
+
             # Check gap if we have both bounds
             if best_lb is not None and best_ub is not None:
                 gap = float(best_ub) - float(best_lb)
@@ -1235,7 +1377,7 @@ class BendersSolver:
                     gap = 0.0
                 rel_gap = gap / max(1.0, abs(best_ub))
                 log.info("bounds: best_lb=%.6g best_ub=%.6g gap=%.6g rel=%.3g", best_lb, best_ub, gap, rel_gap)
-                print(f"[CHECK] GAP: LB={best_lb:.6g} UB={best_ub:.6g} gap={gap:.6g} rel={rel_gap:.3g}")
+                _vprint(f"[CHECK] GAP: LB={best_lb:.6g} UB={best_ub:.6g} gap={gap:.6g} rel={rel_gap:.3g}")
                 prev_best_lb = best_lb
                 prev_best_ub = best_ub
                 if gap <= (tol * max(1.0, abs(best_ub))):
