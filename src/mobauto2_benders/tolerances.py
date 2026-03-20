@@ -17,9 +17,12 @@ def project_binary_value(v: Any, eps_bin: float) -> int | None:
         fv = float(v)
     except Exception:
         return None
-    if fv <= eps_bin:
+    # CPLEX can return tiny integrality residuals (for example ~1e-6 to 1e-5)
+    # even for integer-feasible MIP incumbents, so keep a modest lower bound here.
+    tol = max(float(eps_bin), 1e-5)
+    if fv <= tol:
         return 0
-    if fv >= 1.0 - eps_bin:
+    if fv >= 1.0 - tol:
         return 1
     return None
 
@@ -44,4 +47,3 @@ def project_candidate(
         offenders.sort(key=lambda kv: abs((kv[1] - 0.5) if kv[1] == kv[1] else 1.0), reverse=True)
         offenders = offenders[: max(0, int(max_offenders))]
     return proj, offenders
-

@@ -82,6 +82,7 @@ outputs/
 logs/
 Report/
 tests/
+aux_py/
 
 # Project-specific generated scenarios; keep only one example
 setups/*

@@ -58,6 +58,7 @@ class TimeSection:
 class FleetSection:
     Q: int
     binit: list[float] | None = None
+    initial_actions: list[str] | None = None
 
 
 @dataclass(slots=True)
@@ -385,6 +386,7 @@ def upgrade_config_v1_to_v2(old: Mapping[str, Any]) -> dict[str, Any]:
             "fleet": {
                 "Q": master_params.get("Q"),
                 "binit": master_params.get("binit"),
+                "initial_actions": master_params.get("initial_actions"),
             },
             "energy": {
                 "Emax": master_params.get("Emax"),
@@ -564,13 +566,19 @@ def _parse_v2(raw: Mapping[str, Any]) -> RootConfig:
     )
 
     fleet_raw = _as_mapping(model_raw.get("fleet"), "model.fleet")
-    _check_unknown_keys(fleet_raw, {"Q", "binit"}, "model.fleet")
+    _check_unknown_keys(fleet_raw, {"Q", "binit", "initial_battery", "initial_actions"}, "model.fleet")
     _require_keys(fleet_raw, {"Q"}, "model.fleet")
+    binit_raw = fleet_raw.get("initial_battery", fleet_raw.get("binit"))
     fleet_section = FleetSection(
         Q=_ensure_int(_disallow_expr(fleet_raw.get("Q"), "model.fleet.Q"), "model.fleet.Q"),
         binit=(
-            _ensure_num_list(fleet_raw.get("binit"), "model.fleet.binit")
-            if fleet_raw.get("binit") is not None
+            _ensure_num_list(binit_raw, "model.fleet.initial_battery")
+            if binit_raw is not None
+            else None
+        ),
+        initial_actions=(
+            _ensure_str_list(fleet_raw.get("initial_actions"), "model.fleet.initial_actions")
+            if fleet_raw.get("initial_actions") is not None
             else None
         ),
     )

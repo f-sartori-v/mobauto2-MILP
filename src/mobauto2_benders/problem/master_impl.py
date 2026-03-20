@@ -112,7 +112,7 @@ class ProblemMaster(MasterProblem):
         L = float(self._p("L"))
         delta_chg = float(self._p("delta_chg"))
         # Normalize initial battery vector to length Q
-        _binit_raw = self._p("binit")
+        _binit_raw = self._p("initial_battery", self._p("binit"))
         if _binit_raw is None:
             binit = [0.0] * Q
         elif isinstance(_binit_raw, (int, float)):
@@ -127,9 +127,32 @@ class ProblemMaster(MasterProblem):
                 binit = binit + [fill] * (Q - len(binit))
             elif len(binit) > Q:
                 binit = binit[:Q]
+        # Normalize forced first actions to length Q
+        _initial_actions_raw = self._p("initial_actions")
+        if _initial_actions_raw is None:
+            initial_actions = ["IDL"] * Q
+        elif isinstance(_initial_actions_raw, str):
+            initial_actions = [str(_initial_actions_raw).strip().upper()] * Q
+        else:
+            try:
+                initial_actions = [str(x).strip().upper() for x in list(_initial_actions_raw)]  # type: ignore[arg-type]
+            except Exception:
+                initial_actions = ["IDL"] * Q
+            if len(initial_actions) < Q:
+                initial_actions = initial_actions + ["IDL"] * (Q - len(initial_actions))
+            elif len(initial_actions) > Q:
+                initial_actions = initial_actions[:Q]
+        allowed_initial_actions = {"IDL", "CHR", "OUT", "RET"}
+        invalid_initial_actions = sorted({action for action in initial_actions if action not in allowed_initial_actions})
+        if invalid_initial_actions:
+            raise ValueError(
+                "initial_actions contains invalid value(s): "
+                + ", ".join(invalid_initial_actions)
+                + ". Allowed values are IDL, CHR, OUT, RET."
+            )
 
         # Vehicle location encoding: 0 = Longvilliers (depot), 1 = Massy
-        # All shuttles start at Longvilliers and must end at Longvilliers.
+        # Initial location is implied by the forced first action; all shuttles must end at Longvilliers.
 
         m = pyo.ConcreteModel()
         m.Q = range(Q)
@@ -282,12 +305,30 @@ class ProblemMaster(MasterProblem):
                 )
 
         for q in m.Q:
-            # Start at Longvilliers and end at Longvilliers (no ongoing trip at the end)
-            m.atL[q, 0].fix(1)
-            m.atM[q, 0].fix(0)
+            first_action = initial_actions[q]
+            starts_at_massy = first_action == "RET"
+            # The first forced action defines the shuttle's location at t=0.
+            m.atL[q, 0].fix(0 if starts_at_massy else 1)
+            m.atM[q, 0].fix(1 if starts_at_massy else 0)
             m.atL[q, T - 1].fix(1)
             m.atM[q, T - 1].fix(0)
             m.inTrip[q, T - 1].fix(0)
+            if first_action == "IDL":
+                m.yOUT[q, 0].fix(0)
+                m.yRET[q, 0].fix(0)
+                m.c[q, 0].fix(0)
+            elif first_action == "CHR":
+                m.yOUT[q, 0].fix(0)
+                m.yRET[q, 0].fix(0)
+                m.c[q, 0].fix(1)
+            elif first_action == "OUT":
+                m.yOUT[q, 0].fix(1)
+                m.yRET[q, 0].fix(0)
+                m.c[q, 0].fix(0)
+            elif first_action == "RET":
+                m.yOUT[q, 0].fix(0)
+                m.yRET[q, 0].fix(1)
+                m.c[q, 0].fix(0)
 
         # Optional FIFO symmetry-breaking across vehicles (can restrict starts unintentionally)
         if bool(self._p("use_fifo_symmetry", False)) and Q >= 2:

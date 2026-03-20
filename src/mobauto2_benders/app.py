@@ -77,6 +77,7 @@ def _prepare_params(cfg, overrides: dict | None) -> tuple[dict, dict]:
 
     mp["Q"] = int(fleet.Q)
     _set_if_not_none(mp, "binit", fleet.binit)
+    _set_if_not_none(mp, "initial_actions", fleet.initial_actions)
 
     mp.update(_energy_params_for_resolution(cfg, int(time.slot_resolution)))
 
