@@ -15,7 +15,7 @@ run:
 
 data:
   # Demand source (preferred): file with requests or R_out/R_ret arrays
-  demand_file: setups/nice15.yaml
+  demand_file: setups/nice30.yaml
   # Optional scenario files for multi-scenario runs
   scenario_files: #[setups/rtime1.yaml, setups/rtime2.yaml, setups/rtime3.yaml, setups/rtime4.yaml, setups/rtime5.yaml]
   # Optional weights aligned with scenario_files
@@ -35,8 +35,10 @@ model:
   fleet:
     # Number of shuttles
     Q: 2
-    # Initial battery per shuttle (length Q)
-    binit: [150.0, 150.0, 150.0, 150.0, 150.0, 150.0, 150.0]
+    # Initial battery level per shuttle (length Q)
+    initial_battery: [150.0, 150.0]
+    # Forced first action per shuttle at t=0: IDL, CHR, OUT, RET
+    initial_actions: [IDL, IDL]
   energy:
     # Battery capacity
     Emax: 150
@@ -100,7 +102,7 @@ solver:
   # Benders loop settings
   max_iterations: 100
   tolerance: 0.001
-  time_limit_s: 600
+  time_limit_s: 3600
   # Optional stall-based early stopping
   stall_max_no_improve_iters: 0
   stall_min_abs_improve: 1.0
@@ -113,7 +115,7 @@ solver:
 
 tolerances:
   # Binary projection tolerance
-  eps_bin: 1.0e-6
+  eps_bin: 1.0e-5
   # Feasibility residual tolerance
   eps_feas: 1.0e-7
   # Cut violation/tightness tolerance

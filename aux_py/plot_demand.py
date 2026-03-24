@@ -6,51 +6,52 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-yaml_path = PROJECT_DIR / "setups" / "nice30.yaml"
-csv_path = SCRIPT_DIR / "nice10_grouped_direction_counts.csv"
-png_path = SCRIPT_DIR / "nice10_requests_by_time_and_direction.png"
-
-
+yaml_path = PROJECT_DIR / "setups" / "pds.yaml"
+csv_path = SCRIPT_DIR / f"{yaml_path.stem}__direction_counts.csv"
+png_path = SCRIPT_DIR / f"{yaml_path.stem}_demand.png"
 
 with open(yaml_path, "r", encoding="utf-8") as f:
     data = yaml.safe_load(f)
 
 requests = pd.DataFrame(data["requests"])
+requests["time_bin"] = (requests["time"] // 30) * 30
 
 summary = (
-    requests.groupby(["time", "dir"])
+    requests.groupby(["time_bin", "dir"])
     .size()
     .unstack(fill_value=0)
     .reset_index()
-    .sort_values("time")
+    .sort_values("time_bin")
 )
 
 for col in ["OUT", "RET"]:
     if col not in summary.columns:
         summary[col] = 0
 
-base_minutes = 7 * 60
-summary["clock_time"] = summary["time"].apply(
+base_minutes = 5 * 60
+summary["clock_time"] = summary["time_bin"].apply(
     lambda m: f"{(base_minutes + m)//60}:{(base_minutes + m)%60:02d}"
 )
 
-summary[["time", "clock_time", "OUT", "RET"]].to_csv(csv_path, index=False)
+summary[["time_bin", "clock_time", "OUT", "RET"]].to_csv(csv_path, index=False)
 
 x = range(len(summary))
 width = 0.4
 
-plt.figure(figsize=(14, 6))
-plt.bar([i - width/2 for i in x], summary["OUT"], width=width, label="OUT")
-plt.bar([i + width/2 for i in x], summary["RET"], width=width, label="RET")
+plt.figure(figsize=(12, 6))
+plt.bar([i - width/2 for i in x], summary["OUT"], width=width, label="to-Hub")
+plt.bar([i + width/2 for i in x], summary["RET"], width=width, label="from-Hub")
 
 plt.xticks(list(x), summary["clock_time"], rotation=45)
 plt.xlabel("Time")
-plt.ylabel("Number of requests")
-plt.title("Requests by time slot and direction (nice10)")
+plt.ylim(0, 30)
+plt.yticks(range(0, 31, 5))
+plt.ylabel("Number of bookings")
+plt.title("Demand by time slot and direction")
 plt.legend()
 plt.tight_layout()
 
-plt.savefig(png_path, dpi=200, bbox_inches="tight")
+plt.savefig(png_path, dpi=300, bbox_inches="tight")
 plt.show()
 
 summary[["clock_time", "OUT", "RET"]]
