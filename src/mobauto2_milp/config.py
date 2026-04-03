@@ -83,7 +83,7 @@ class ModelSection:
 
 
 @dataclass(slots=True)
-class MasterSection:
+class MilpSection:
     use_fifo_symmetry: bool = False
     symmetry_breaking: bool = False
     use_mip_start: bool = False
@@ -91,37 +91,19 @@ class MasterSection:
     mipgap: float | None = None
     cplex_options: dict[str, Any] = field(default_factory=dict)
     solver_backend: str = "cplex_direct"
-    aggregate_cuts_by_tau: bool = True
-    cut_coeff_threshold: float = 0.0
-    theta_per_scenario: bool = False
-    write_lp_after_cut: bool = False
 
 
 @dataclass(slots=True)
-class SubproblemSection:
-    multi_cuts_by_scenario: bool = True
-    use_magnanti_wong: bool = False
-    mw_core_alpha: float = 0.3
-    mw_core_eps: float = 1e-3
-    use_dual_slopes: bool = False
+class ServiceSection:
     S: float = 0.0
     Wmax_minutes: int | None = None
     Wmax_slots: int | None = None
     p: float = 0.0
     fill_first_epsilon: float = 0.0
-    unused_capacity_penalty: float = 0.0
 
 
 @dataclass(slots=True)
 class SolverSection:
-    max_iterations: int
-    tolerance: float
-    time_limit_s: int
-    stall_max_no_improve_iters: int = 0
-    stall_min_abs_improve: float = 0.0
-    stall_min_rel_improve: float = 0.0
-    master_solver: str = "cplex"
-    subproblem_solver: str = "cplex_direct"
     solver_tee: bool = False
 
 
@@ -131,18 +113,9 @@ class RootConfig:
     run: RunSection
     data: DataSection
     model: ModelSection
-    master: MasterSection
-    subproblem: SubproblemSection
+    milp: MilpSection
+    service: ServiceSection
     solver: SolverSection
-    tolerances: "TolerancesSection"
-
-
-@dataclass(slots=True)
-class TolerancesSection:
-    eps_bin: float = 1e-6
-    eps_feas: float = 1e-7
-    eps_cut: float = 1e-8
-    eps_hash: float = 1e-6
 
 
 # ---- Expression evaluation (energy params only) ----
@@ -334,7 +307,7 @@ def _load_yaml(path: Path) -> dict[str, Any]:
 
 
 def upgrade_config_v1_to_v2(old: Mapping[str, Any]) -> dict[str, Any]:
-    """Upgrade a v1 config dict to the v2 schema.
+    """Upgrade a v1 config dict to the current schema.
 
     Emits warnings describing deprecated keys and their mappings.
     """
@@ -359,7 +332,7 @@ def upgrade_config_v1_to_v2(old: Mapping[str, Any]) -> dict[str, Any]:
         warnings_list.append(msg)
 
     new: dict[str, Any] = {
-        "schema": {"name": "mobauto2_benders_config", "version": 2},
+        "schema": {"name": "mobauto2_milp_config", "version": 3},
         "run": {
             "name": None,
             "log_level": run.get("log_level", "INFO"),
@@ -398,7 +371,7 @@ def upgrade_config_v1_to_v2(old: Mapping[str, Any]) -> dict[str, Any]:
                 "concurrency_penalty": master_params.get("concurrency_penalty", 0.0),
             },
         },
-        "master": {
+        "milp": {
             "use_fifo_symmetry": master_params.get("use_fifo_symmetry", False),
             "symmetry_breaking": master_params.get("symmetry_breaking", False),
             "use_mip_start": master_params.get("use_mip_start", False),
@@ -406,42 +379,22 @@ def upgrade_config_v1_to_v2(old: Mapping[str, Any]) -> dict[str, Any]:
             "mipgap": master_params.get("mipgap"),
             "cplex_options": master_params.get("cplex_options", {}),
             "solver_backend": master_params.get("solver_backend", "cplex_direct"),
-            "aggregate_cuts_by_tau": master_params.get("aggregate_cuts_by_tau", True),
-            "cut_coeff_threshold": master_params.get("cut_coeff_threshold", 0.0),
-            "theta_per_scenario": master_params.get("theta_per_scenario", False),
-            "write_lp_after_cut": master_params.get("write_lp_after_cut", False),
         },
-        "subproblem": {
-            "multi_cuts_by_scenario": sub_params.get("multi_cuts_by_scenario", True),
-            "use_magnanti_wong": sub_params.get("use_magnanti_wong", False),
-            "mw_core_alpha": sub_params.get("mw_core_alpha", 0.3),
-            "mw_core_eps": sub_params.get("mw_core_eps", 1e-3),
-            "use_dual_slopes": sub_params.get("use_dual_slopes", False),
+        "service": {
             "S": sub_params.get("S"),
             "Wmax_minutes": sub_params.get("Wmax_minutes"),
             "Wmax_slots": sub_params.get("Wmax_slots"),
             "p": sub_params.get("p"),
             "fill_first_epsilon": sub_params.get("fill_first_epsilon", 0.0),
-            "unused_capacity_penalty": sub_params.get("unused_capacity_penalty", 0.0),
         },
-        "solver": {
-            "max_iterations": run.get("max_iterations", 100),
-            "tolerance": run.get("tolerance", 1e-4),
-            "time_limit_s": run.get("time_limit_s", 600),
-            "stall_max_no_improve_iters": run.get("stall_max_no_improve_iters", 0),
-            "stall_min_abs_improve": run.get("stall_min_abs_improve", 0.0),
-            "stall_min_rel_improve": run.get("stall_min_rel_improve", 0.0),
-            "master_solver": master_params.get("solver", "cplex"),
-            "subproblem_solver": sub_params.get("lp_solver", "cplex_direct"),
-            "solver_tee": master_params.get("solver_tee", False),
-        },
+        "solver": {"solver_tee": master_params.get("solver_tee", False)},
     }
 
-    _note("Deprecated v1 key 'run.*' mapped to 'run.*' (logging) and 'solver.*' (iterations/tolerance/time limits).")
+    _note("Deprecated v1 key 'run.*' mapped to 'run.*' (logging only).")
     _note(f"v1 run keys: {sorted(run.keys())}")
-    _note("Deprecated v1 key 'master.params.*' mapped into 'model.*', 'master.*', and 'solver.*'.")
+    _note("Deprecated v1 key 'master.params.*' mapped into 'model.*', 'milp.*', and 'solver.*'.")
     _note(f"v1 master.params keys: {sorted(master_params.keys())}")
-    _note("Deprecated v1 key 'subproblem.params.*' mapped into 'data.*', 'subproblem.*', and 'solver.*'.")
+    _note("Deprecated v1 key 'subproblem.params.*' mapped into 'data.*', 'service.*', and 'solver.*'.")
     _note(f"v1 subproblem.params keys: {sorted(sub_params.keys())}")
 
     if warnings_list:
@@ -453,14 +406,14 @@ def upgrade_config_v1_to_v2(old: Mapping[str, Any]) -> dict[str, Any]:
     return new
 
 
-def _parse_v2(raw: Mapping[str, Any]) -> RootConfig:
+def _parse_v3(raw: Mapping[str, Any]) -> RootConfig:
     data = _as_mapping(raw, "config")
     _check_unknown_keys(
         data,
-        {"schema", "run", "data", "model", "master", "subproblem", "solver", "tolerances"},
+        {"schema", "run", "data", "model", "milp", "service", "master", "subproblem", "solver", "tolerances"},
         "config",
     )
-    _require_keys(data, {"schema", "run", "data", "model", "master", "subproblem", "solver"}, "config")
+    _require_keys(data, {"schema", "run", "data", "model", "solver"}, "config")
 
     schema_raw = _as_mapping(data.get("schema"), "schema")
     _check_unknown_keys(schema_raw, {"name", "version"}, "schema")
@@ -469,8 +422,8 @@ def _parse_v2(raw: Mapping[str, Any]) -> RootConfig:
         name=_ensure_str(schema_raw.get("name"), "schema.name"),
         version=_ensure_int(schema_raw.get("version"), "schema.version"),
     )
-    if schema.name != "mobauto2_benders_config" or schema.version != 2:
-        raise ValueError("Unsupported schema version; expected mobauto2_benders_config v2")
+    if schema.name != "mobauto2_milp_config" or schema.version not in (2, 3):
+        raise ValueError("Unsupported schema version; expected mobauto2_milp_config v2 or v3")
 
     run_raw = _as_mapping(data.get("run"), "run")
     _check_unknown_keys(run_raw, {"name", "log_level", "log_file", "report_dir", "seed"}, "run")
@@ -617,165 +570,83 @@ def _parse_v2(raw: Mapping[str, Any]) -> RootConfig:
         ),
     )
 
-    master_raw = _as_mapping(data.get("master"), "master")
-    if ("use_" + "lazy" + "_cuts") in master_raw:
+    milp_key = "milp" if "milp" in data else "master"
+    service_key = "service" if "service" in data else "subproblem"
+    if milp_key not in data:
+        raise ValueError("config must include milp")
+    if service_key not in data:
+        raise ValueError("config must include service")
+
+    milp_raw = _as_mapping(data.get(milp_key), milp_key)
+    if ("use_" + "lazy" + "_cuts") in milp_raw:
         raise ValueError("lazy " + "cuts removed; delete key use_" + "lazy" + "_cuts")
     _check_unknown_keys(
-        master_raw,
-        {
-            "use_fifo_symmetry",
-            "symmetry_breaking",
-            "use_mip_start",
-            "solve_time_limit_s",
-            "mipgap",
-            "cplex_options",
-            "solver_backend",
-            "aggregate_cuts_by_tau",
-            "cut_coeff_threshold",
-            "theta_per_scenario",
-            "write_lp_after_cut",
-        },
-        "master",
+        milp_raw,
+        {"use_fifo_symmetry", "symmetry_breaking", "use_mip_start", "solve_time_limit_s", "mipgap", "cplex_options", "solver_backend"},
+        milp_key,
     )
-    master_section = MasterSection(
-        use_fifo_symmetry=_ensure_bool(master_raw.get("use_fifo_symmetry", False), "master.use_fifo_symmetry"),
-        symmetry_breaking=_ensure_bool(master_raw.get("symmetry_breaking", False), "master.symmetry_breaking"),
-        use_mip_start=_ensure_bool(master_raw.get("use_mip_start", False), "master.use_mip_start"),
+    milp_section = MilpSection(
+        use_fifo_symmetry=_ensure_bool(milp_raw.get("use_fifo_symmetry", False), f"{milp_key}.use_fifo_symmetry"),
+        symmetry_breaking=_ensure_bool(milp_raw.get("symmetry_breaking", False), f"{milp_key}.symmetry_breaking"),
+        use_mip_start=_ensure_bool(milp_raw.get("use_mip_start", False), f"{milp_key}.use_mip_start"),
         solve_time_limit_s=(
             _ensure_int(
-                _disallow_expr(master_raw.get("solve_time_limit_s"), "master.solve_time_limit_s"),
-                "master.solve_time_limit_s",
+                _disallow_expr(milp_raw.get("solve_time_limit_s"), f"{milp_key}.solve_time_limit_s"),
+                f"{milp_key}.solve_time_limit_s",
             )
-            if master_raw.get("solve_time_limit_s") is not None
+            if milp_raw.get("solve_time_limit_s") is not None
             else None
         ),
         mipgap=(
             _ensure_float(
-                _disallow_expr(master_raw.get("mipgap"), "master.mipgap"),
-                "master.mipgap",
+                _disallow_expr(milp_raw.get("mipgap"), f"{milp_key}.mipgap"),
+                f"{milp_key}.mipgap",
             )
-            if master_raw.get("mipgap") is not None
+            if milp_raw.get("mipgap") is not None
             else None
         ),
-        cplex_options=_ensure_mapping(master_raw.get("cplex_options"), "master.cplex_options"),
-        solver_backend=_ensure_str(master_raw.get("solver_backend", "cplex_direct"), "master.solver_backend"),
-        aggregate_cuts_by_tau=_ensure_bool(master_raw.get("aggregate_cuts_by_tau", True), "master.aggregate_cuts_by_tau"),
-        cut_coeff_threshold=_ensure_float(
-            _disallow_expr(master_raw.get("cut_coeff_threshold", 0.0), "master.cut_coeff_threshold"),
-            "master.cut_coeff_threshold",
-        ),
-        theta_per_scenario=_ensure_bool(master_raw.get("theta_per_scenario", False), "master.theta_per_scenario"),
-        write_lp_after_cut=_ensure_bool(master_raw.get("write_lp_after_cut", False), "master.write_lp_after_cut"),
+        cplex_options=_ensure_mapping(milp_raw.get("cplex_options"), f"{milp_key}.cplex_options"),
+        solver_backend=_ensure_str(milp_raw.get("solver_backend", "cplex_direct"), f"{milp_key}.solver_backend"),
     )
 
-    sub_raw = _as_mapping(data.get("subproblem"), "subproblem")
+    service_raw = _as_mapping(data.get(service_key), service_key)
     _check_unknown_keys(
-        sub_raw,
-        {
-            "multi_cuts_by_scenario",
-            "use_magnanti_wong",
-            "mw_core_alpha",
-            "mw_core_eps",
-            "use_dual_slopes",
-            "S",
-            "Wmax_minutes",
-            "Wmax_slots",
-            "p",
-            "fill_first_epsilon",
-            "unused_capacity_penalty",
-        },
-        "subproblem",
+        service_raw,
+        {"S", "Wmax_minutes", "Wmax_slots", "p", "fill_first_epsilon"},
+        service_key,
     )
-    _require_keys(sub_raw, {"S", "p"}, "subproblem")
-    if "Wmax_minutes" not in sub_raw and "Wmax_slots" not in sub_raw:
-        raise ValueError("subproblem must include Wmax_minutes or Wmax_slots")
-    sub_section = SubproblemSection(
-        multi_cuts_by_scenario=_ensure_bool(sub_raw.get("multi_cuts_by_scenario", True), "subproblem.multi_cuts_by_scenario"),
-        use_magnanti_wong=_ensure_bool(sub_raw.get("use_magnanti_wong", False), "subproblem.use_magnanti_wong"),
-        mw_core_alpha=_ensure_float(
-            _disallow_expr(sub_raw.get("mw_core_alpha", 0.3), "subproblem.mw_core_alpha"),
-            "subproblem.mw_core_alpha",
-        ),
-        mw_core_eps=_ensure_float(
-            _disallow_expr(sub_raw.get("mw_core_eps", 1e-3), "subproblem.mw_core_eps"),
-            "subproblem.mw_core_eps",
-        ),
-        use_dual_slopes=_ensure_bool(sub_raw.get("use_dual_slopes", False), "subproblem.use_dual_slopes"),
-        S=_ensure_float(_disallow_expr(sub_raw.get("S"), "subproblem.S"), "subproblem.S"),
+    _require_keys(service_raw, {"S", "p"}, service_key)
+    if "Wmax_minutes" not in service_raw and "Wmax_slots" not in service_raw:
+        raise ValueError(f"{service_key} must include Wmax_minutes or Wmax_slots")
+    service_section = ServiceSection(
+        S=_ensure_float(_disallow_expr(service_raw.get("S"), f"{service_key}.S"), f"{service_key}.S"),
         Wmax_minutes=(
             _ensure_int(
-                _disallow_expr(sub_raw.get("Wmax_minutes"), "subproblem.Wmax_minutes"),
-                "subproblem.Wmax_minutes",
+                _disallow_expr(service_raw.get("Wmax_minutes"), f"{service_key}.Wmax_minutes"),
+                f"{service_key}.Wmax_minutes",
             )
-            if sub_raw.get("Wmax_minutes") is not None
+            if service_raw.get("Wmax_minutes") is not None
             else None
         ),
         Wmax_slots=(
             _ensure_int(
-                _disallow_expr(sub_raw.get("Wmax_slots"), "subproblem.Wmax_slots"),
-                "subproblem.Wmax_slots",
+                _disallow_expr(service_raw.get("Wmax_slots"), f"{service_key}.Wmax_slots"),
+                f"{service_key}.Wmax_slots",
             )
-            if sub_raw.get("Wmax_slots") is not None
+            if service_raw.get("Wmax_slots") is not None
             else None
         ),
-        p=_ensure_float(_disallow_expr(sub_raw.get("p"), "subproblem.p"), "subproblem.p"),
+        p=_ensure_float(_disallow_expr(service_raw.get("p"), f"{service_key}.p"), f"{service_key}.p"),
         fill_first_epsilon=_ensure_float(
-            _disallow_expr(sub_raw.get("fill_first_epsilon", 0.0), "subproblem.fill_first_epsilon"),
-            "subproblem.fill_first_epsilon",
-        ),
-        unused_capacity_penalty=_ensure_float(
-            _disallow_expr(sub_raw.get("unused_capacity_penalty", 0.0), "subproblem.unused_capacity_penalty"),
-            "subproblem.unused_capacity_penalty",
+            _disallow_expr(service_raw.get("fill_first_epsilon", 0.0), f"{service_key}.fill_first_epsilon"),
+            f"{service_key}.fill_first_epsilon",
         ),
     )
 
     solver_raw = _as_mapping(data.get("solver"), "solver")
-    _check_unknown_keys(
-        solver_raw,
-        {
-            "max_iterations",
-            "tolerance",
-            "time_limit_s",
-            "stall_max_no_improve_iters",
-            "stall_min_abs_improve",
-            "stall_min_rel_improve",
-            "master_solver",
-            "subproblem_solver",
-            "solver_tee",
-        },
-        "solver",
-    )
-    _require_keys(solver_raw, {"max_iterations", "tolerance", "time_limit_s", "master_solver", "subproblem_solver"}, "solver")
+    _check_unknown_keys(solver_raw, {"solver_tee"}, "solver")
     solver_section = SolverSection(
-        max_iterations=_ensure_int(_disallow_expr(solver_raw.get("max_iterations"), "solver.max_iterations"), "solver.max_iterations"),
-        tolerance=_ensure_float(_disallow_expr(solver_raw.get("tolerance"), "solver.tolerance"), "solver.tolerance"),
-        time_limit_s=_ensure_int(_disallow_expr(solver_raw.get("time_limit_s"), "solver.time_limit_s"), "solver.time_limit_s"),
-        stall_max_no_improve_iters=_ensure_int(
-            _disallow_expr(solver_raw.get("stall_max_no_improve_iters", 0), "solver.stall_max_no_improve_iters"),
-            "solver.stall_max_no_improve_iters",
-        ),
-        stall_min_abs_improve=_ensure_float(
-            _disallow_expr(solver_raw.get("stall_min_abs_improve", 0.0), "solver.stall_min_abs_improve"),
-            "solver.stall_min_abs_improve",
-        ),
-        stall_min_rel_improve=_ensure_float(
-            _disallow_expr(solver_raw.get("stall_min_rel_improve", 0.0), "solver.stall_min_rel_improve"),
-            "solver.stall_min_rel_improve",
-        ),
-        master_solver=_ensure_str(solver_raw.get("master_solver"), "solver.master_solver"),
-        subproblem_solver=_ensure_str(solver_raw.get("subproblem_solver"), "solver.subproblem_solver"),
         solver_tee=_ensure_bool(solver_raw.get("solver_tee", False), "solver.solver_tee"),
-    )
-    if solver_section.master_solver.lower() == "cplex_persistent":
-        raise ValueError("persistent solver mode removed; use solver.master_solver=cplex")
-
-    tol_raw = _as_mapping(data.get("tolerances", {}), "tolerances")
-    _check_unknown_keys(tol_raw, {"eps_bin", "eps_feas", "eps_cut", "eps_hash"}, "tolerances")
-    tol_section = TolerancesSection(
-        eps_bin=_ensure_float(_disallow_expr(tol_raw.get("eps_bin", 1e-6), "tolerances.eps_bin"), "tolerances.eps_bin"),
-        eps_feas=_ensure_float(_disallow_expr(tol_raw.get("eps_feas", 1e-7), "tolerances.eps_feas"), "tolerances.eps_feas"),
-        eps_cut=_ensure_float(_disallow_expr(tol_raw.get("eps_cut", 1e-8), "tolerances.eps_cut"), "tolerances.eps_cut"),
-        eps_hash=_ensure_float(_disallow_expr(tol_raw.get("eps_hash", 1e-6), "tolerances.eps_hash"), "tolerances.eps_hash"),
     )
 
     model_section = ModelSection(
@@ -790,26 +661,21 @@ def _parse_v2(raw: Mapping[str, Any]) -> RootConfig:
         run=run,
         data=data_section,
         model=model_section,
-        master=master_section,
-        subproblem=sub_section,
+        milp=milp_section,
+        service=service_section,
         solver=solver_section,
-        tolerances=tol_section,
     )
 
 
 def load_config(path: str | Path | None) -> RootConfig:
-    """Load configuration from YAML and return the v2 config dataclasses."""
+    """Load configuration from YAML and return the current config dataclasses."""
     cfg_path = DEFAULT_CONFIG_PATH if path is None else Path(path)
     if not cfg_path.exists():
         raise FileNotFoundError(f"Config file not found: {cfg_path}")
     raw = _load_yaml(cfg_path)
     if "schema" not in raw:
         raw = upgrade_config_v1_to_v2(raw)
-    else:
-        schema_raw = raw.get("schema")
-        if not isinstance(schema_raw, dict) or schema_raw.get("version") != 2:
-            raw = upgrade_config_v1_to_v2(raw)
-    return _parse_v2(raw)
+    return _parse_v3(raw)
 
 
 __all__ = [
@@ -821,11 +687,10 @@ __all__ = [
     "EnergySection",
     "CostSection",
     "ModelSection",
-    "MasterSection",
-    "SubproblemSection",
+    "MilpSection",
+    "ServiceSection",
     "SolverSection",
     "RootConfig",
-    "TolerancesSection",
     "DEFAULT_CONFIG_PATH",
     "load_config",
     "resolve_energy_params",

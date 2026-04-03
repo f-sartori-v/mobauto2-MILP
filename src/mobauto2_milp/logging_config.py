@@ -56,7 +56,7 @@ def setup_logging(level: str = "INFO") -> None:
             out_dir = Path("Report")
             out_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            log_path = out_dir / f"benders_debug_{ts}.txt"
+            log_path = out_dir / f"milp_debug_{ts}.txt"
             # Open one shared file for both logging and print tee
             f = open(log_path, mode="w", encoding="utf-8", buffering=1)
             # Attach a logging handler that writes to this file

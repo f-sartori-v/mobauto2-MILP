@@ -4,27 +4,20 @@ from pathlib import Path
 
 from .config import DEFAULT_CONFIG_PATH, load_config, resolve_energy_params
 from .logging_config import setup_logging
-from .benders.solver import BendersSolver, BendersRunResult
+from .monolith import MonolithSolver
+from .solver import RunResult
 
 
 def import_problem_impl():
-    """Import default problem-specific implementations.
-
-    Expects classes `ProblemMaster` and `ProblemSubproblem` in
-    `mobauto2_benders.problem.master_impl` and `.subproblem_impl`.
-    """
+    """Import the integrated MILP model implementation."""
     try:
-        from .problem.master_impl import ProblemMaster  # type: ignore
-        from .problem.subproblem_impl import ProblemSubproblem  # type: ignore
-        return ProblemMaster, ProblemSubproblem
+        from .model import MobautoMilpModel  # type: ignore
+        return MobautoMilpModel
     except Exception as exc:  # noqa: BLE001 - provide friendly message
         raise SystemExit(
-            "Problem-specific implementations not found.\n"
-            "Create classes `ProblemMaster` and `ProblemSubproblem` under:\n"
-            "  src/mobauto2_benders/problem/master_impl.py\n"
-            "  src/mobauto2_benders/problem/subproblem_impl.py\n"
-            "Each should extend the abstract base classes in\n"
-            "  src/mobauto2_benders/benders/master.py and subproblem.py\n"
+            "Integrated MILP model implementation not found.\n"
+            "Expected class `MobautoMilpModel` in:\n"
+            "  src/mobauto2_milp/model.py\n"
             f"\nOriginal import error: {exc}"
         )
 
@@ -84,43 +77,42 @@ def _prepare_params(cfg, overrides: dict | None) -> tuple[dict, dict]:
     _set_if_not_none(mp, "start_cost_epsilon", costs.start_cost_epsilon)
     _set_if_not_none(mp, "concurrency_penalty", costs.concurrency_penalty)
 
-    mp["use_fifo_symmetry"] = bool(cfg.master.use_fifo_symmetry)
-    mp["symmetry_breaking"] = bool(cfg.master.symmetry_breaking)
-    mp["eps_bin"] = float(cfg.tolerances.eps_bin)
-    mp["eps_cut"] = float(cfg.tolerances.eps_cut)
-    mp["use_mip_start"] = bool(cfg.master.use_mip_start)
-    if cfg.master.solve_time_limit_s is not None:
-        mp["solve_time_limit_s"] = int(cfg.master.solve_time_limit_s)
-    if cfg.master.mipgap is not None:
-        mp["mipgap"] = float(cfg.master.mipgap)
-    if cfg.master.cplex_options:
-        mp["cplex_options"] = dict(cfg.master.cplex_options)
-    if cfg.master.solver_backend:
-        mp["solver_backend"] = str(cfg.master.solver_backend)
-    mp["aggregate_cuts_by_tau"] = bool(cfg.master.aggregate_cuts_by_tau)
-    mp["cut_coeff_threshold"] = float(cfg.master.cut_coeff_threshold)
-    mp["theta_per_scenario"] = bool(cfg.master.theta_per_scenario)
-    mp["write_lp_after_cut"] = bool(cfg.master.write_lp_after_cut)
+    mp["use_fifo_symmetry"] = bool(cfg.milp.use_fifo_symmetry)
+    mp["symmetry_breaking"] = bool(cfg.milp.symmetry_breaking)
+    mp["eps_bin"] = 1.0e-5
+    mp["eps_cut"] = 1.0e-8
+    mp["use_mip_start"] = bool(cfg.milp.use_mip_start)
+    if cfg.milp.solve_time_limit_s is not None:
+        mp["solve_time_limit_s"] = int(cfg.milp.solve_time_limit_s)
+    if cfg.milp.mipgap is not None:
+        mp["mipgap"] = float(cfg.milp.mipgap)
+    if cfg.milp.cplex_options:
+        mp["cplex_options"] = dict(cfg.milp.cplex_options)
+    if cfg.milp.solver_backend:
+        mp["solver_backend"] = str(cfg.milp.solver_backend)
+    mp["aggregate_cuts_by_tau"] = True
+    mp["cut_coeff_threshold"] = 0.0
+    mp["theta_per_scenario"] = False
+    mp["write_lp_after_cut"] = False
 
-    mp["solver"] = cfg.solver.master_solver
+    mp["solver"] = str(cfg.milp.solver_backend)
     mp["solver_tee"] = bool(cfg.solver.solver_tee)
     mp["log_level"] = str(cfg.run.log_level)
     mp["emit_reports"] = str(cfg.run.log_level).upper() != "REPORT"
 
-    sp["lp_solver"] = cfg.solver.subproblem_solver
-    sp["multi_cuts_by_scenario"] = bool(cfg.subproblem.multi_cuts_by_scenario)
-    sp["use_magnanti_wong"] = bool(cfg.subproblem.use_magnanti_wong)
-    sp["mw_core_alpha"] = float(cfg.subproblem.mw_core_alpha)
-    sp["mw_core_eps"] = float(getattr(cfg.subproblem, "mw_core_eps", 1e-3))
-    sp["use_dual_slopes"] = bool(cfg.subproblem.use_dual_slopes)
-    sp["S"] = cfg.subproblem.S
-    _set_if_not_none(sp, "Wmax_minutes", cfg.subproblem.Wmax_minutes)
-    _set_if_not_none(sp, "Wmax_slots", cfg.subproblem.Wmax_slots)
-    sp["p"] = cfg.subproblem.p
-    sp["fill_first_epsilon"] = float(cfg.subproblem.fill_first_epsilon)
-    sp["unused_capacity_penalty"] = float(cfg.subproblem.unused_capacity_penalty)
-    # tolerances
-    sp["eps_cut"] = float(cfg.tolerances.eps_cut)
+    sp["lp_solver"] = str(cfg.milp.solver_backend)
+    sp["multi_cuts_by_scenario"] = False
+    sp["use_magnanti_wong"] = False
+    sp["mw_core_alpha"] = 0.3
+    sp["mw_core_eps"] = 1e-3
+    sp["use_dual_slopes"] = False
+    sp["S"] = cfg.service.S
+    _set_if_not_none(sp, "Wmax_minutes", cfg.service.Wmax_minutes)
+    _set_if_not_none(sp, "Wmax_slots", cfg.service.Wmax_slots)
+    sp["p"] = cfg.service.p
+    sp["fill_first_epsilon"] = float(cfg.service.fill_first_epsilon)
+    sp["unused_capacity_penalty"] = 0.0
+    sp["eps_cut"] = 1.0e-8
 
     _set_if_not_none(sp, "demand_file", cfg.data.demand_file)
     _set_if_not_none(sp, "scenario_files", cfg.data.scenario_files if cfg.data.scenario_files else None)
@@ -140,11 +132,7 @@ def _prepare_params(cfg, overrides: dict | None) -> tuple[dict, dict]:
     if "slot_resolution" not in sp and "slot_resolution" in mp:
         sp["slot_resolution"] = mp["slot_resolution"]
 
-    # If multi-cuts by scenario is enabled and scenarios present, propagate scenario count/weights to master
-    try:
-        multi_cuts = bool(sp.get("multi_cuts_by_scenario", False))
-    except Exception:
-        multi_cuts = False
+    # Propagate scenario count/weights to the integrated model whenever scenarios are present.
     scen_list = []
     try:
         if isinstance(sp.get("scenarios"), list) and sp.get("scenarios"):
@@ -153,11 +141,9 @@ def _prepare_params(cfg, overrides: dict | None) -> tuple[dict, dict]:
             scen_list = list(sp.get("scenario_files"))
     except Exception:
         scen_list = []
-    if multi_cuts and scen_list:
+    if scen_list:
         S = len(scen_list)
-        mp.setdefault("theta_per_scenario", True)
         mp["num_scenarios"] = S
-        # Pass weights if provided; else default uniform weights summing to 1
         wts = sp.get("scenario_weights")
         if not isinstance(wts, list) or len(wts) != S:
             wts = [1.0 / float(S) for _ in range(S)]
@@ -166,19 +152,11 @@ def _prepare_params(cfg, overrides: dict | None) -> tuple[dict, dict]:
     return mp, sp
 
 
-def _build_solver(cfg, mp: dict, sp: dict):
-    ProblemMaster, ProblemSubproblem = import_problem_impl()
-    master = ProblemMaster(mp)
-    sub = ProblemSubproblem(sp)
-    solver = BendersSolver(master, sub, cfg)
-    return solver, master, sub
-
-
 def _print_cfg(cfg, mp: dict, sp: dict) -> None:
     print("Run configuration:")
     print(
-        f"  solver: iterations={cfg.solver.max_iterations} tol={cfg.solver.tolerance} "
-        f"time_limit_s={cfg.solver.time_limit_s} seed={cfg.run.seed}"
+        f"  solver: backend={mp.get('solver', '-')} time_limit_s={mp.get('solve_time_limit_s', 3600)} "
+        f"mipgap={mp.get('mipgap', '-')} seed={cfg.run.seed}"
     )
     T_minutes = mp.get("T_minutes")
     slot_res = mp.get("slot_resolution", 1)
@@ -192,7 +170,7 @@ def _print_cfg(cfg, mp: dict, sp: dict) -> None:
         T_slots = mp.get("T", "-")
     trip_slots = mp.get("trip_slots")
     print(
-        "  master: solver=%s Q=%s T_minutes=%s slot_res=%s (slots=%s) trip_dur_min=%s Emax=%s L=%s eps=%s conc_pen=%s delta_chg=%s"
+        "  milp: solver=%s Q=%s T_minutes=%s slot_res=%s (slots=%s) trip_dur_min=%s Emax=%s L=%s eps=%s conc_pen=%s delta_chg=%s"
         % (
             mp.get("solver", "-"),
             mp.get("Q", "-"),
@@ -223,7 +201,7 @@ def _print_cfg(cfg, mp: dict, sp: dict) -> None:
     except Exception:
         pass
     print(
-        "  subproblem: solver=%s S=%s Wmax=%s p=%s fill_eps=%s (slot_res=%s)"
+        "  service: solver=%s S=%s Wmax=%s p=%s fill_eps=%s (slot_res=%s)"
         % (
             sp.get("lp_solver", "-"),
             sp.get("S", "-"),
@@ -243,11 +221,10 @@ def _print_cfg(cfg, mp: dict, sp: dict) -> None:
         print(f"  R_ret: {sp.get('R_ret')} (inline)")
 
 
-def _maybe_print_summary(result: BendersRunResult, sp: dict) -> None:
+def _maybe_print_summary(result: RunResult, sp: dict) -> None:
     try:
         if result.pax_served is not None and result.pax_total is not None:
             print(f"Pax served: {result.pax_served:.0f}/{result.pax_total:.0f}")
-        # Use subproblem diagnostics for consistent decomposition
         if result.subproblem_obj is not None:
             wait_slots = float(result.sp_wait_cost_slots or 0.0)
             fill_eps = float(result.sp_fill_eps_cost or 0.0)
@@ -269,7 +246,7 @@ def _maybe_print_summary(result: BendersRunResult, sp: dict) -> None:
             if result.pax_served and result.pax_served > 0:
                 wait_per_pax_min = (wait_slots * float(slot_res)) / float(result.pax_served)
             print(
-                "Subproblem (last): obj=%.6g wait_slots=%.6g fill_eps=%.6g penalty_cost=%.6g penalty_pax=%.6g total_demand=%.6g"
+                "Service block: obj=%.6g wait_slots=%.6g fill_eps=%.6g penalty_cost=%.6g penalty_pax=%.6g total_demand=%.6g"
                 % (float(result.subproblem_obj), wait_slots, fill_eps, pen_cost, pen_pax, total_dem)
             )
             if wait_per_pax_min is not None:
@@ -278,10 +255,7 @@ def _maybe_print_summary(result: BendersRunResult, sp: dict) -> None:
             print(f"UB_total (best): {float(result.best_upper_bound):.6g}")
     except Exception:
         pass
-    print(
-        f"\nResult: status={result.status} iterations={result.iterations} "
-        f"best_lb={result.best_lower_bound} best_ub={result.best_upper_bound}"
-    )
+    print(f"\nResult: status={result.status} iterations={result.iterations} best_lb={result.best_lower_bound} best_ub={result.best_upper_bound}")
 
 
 def _map_candidate_to_warm_start(
@@ -340,10 +314,11 @@ def _run_single(
     warm_start: dict | None = None,
     emit_summary: bool = True,
 ):
-    solver, master, _sub = _build_solver(cfg, mp, sp)
+    model_cls = import_problem_impl()
+    solver = MonolithSolver(model_cls, cfg, mp, sp)
     if warm_start:
         try:
-            master.set_warm_start(warm_start)
+            solver.master.set_warm_start(warm_start)
         except Exception:
             pass
     if emit_cli_output:
@@ -351,11 +326,26 @@ def _run_single(
     result = solver.run()
     if emit_cli_output and emit_summary:
         _maybe_print_summary(result, sp)
-    return result, master
+        if solver.has_incumbent_solution():
+            try:
+                print("\nBest Master Solution:")
+                print(solver.format_solution())
+            except Exception:
+                pass
+        else:
+            print("\nNo incumbent solution loaded; detailed schedule is unavailable.")
+        try:
+            report = solver.format_report()
+            if report:
+                print("")
+                print(report)
+        except Exception:
+            pass
+    return result, solver.master
 
 
-def run(config_path: str | Path | None = None, overrides: dict | None = None) -> BendersRunResult:
-    """Run the Benders solver with a single canonical execution path.
+def run(config_path: str | Path | None = None, overrides: dict | None = None) -> RunResult:
+    """Run the monolithic MILP solver with a single canonical execution path.
 
     Parameters are taken from configs/default.yaml by default.
     """
@@ -374,7 +364,7 @@ def run(config_path: str | Path | None = None, overrides: dict | None = None) ->
             raise ValueError("No valid resolutions provided for multi-res run.")
         prev_cand: dict[str, float] | None = None
         prev_res: int | None = None
-        last_result: BendersRunResult | None = None
+        last_result: RunResult | None = None
         for i, res in enumerate(seq, start=1):
             mp = dict(mp_base)
             sp = dict(sp_base)

@@ -8,8 +8,8 @@ if __package__ in (None, ""):
     SRC_ROOT = THIS_FILE.parents[1]
     if str(SRC_ROOT) not in sys.path:
         sys.path.insert(0, str(SRC_ROOT))
-    from mobauto2_benders.app import DEFAULT_CONFIG_PATH, import_problem_impl, run as app_run  # type: ignore
-    from mobauto2_benders.config import load_config  # type: ignore
+    from mobauto2_milp.app import DEFAULT_CONFIG_PATH, import_problem_impl, run as app_run  # type: ignore
+    from mobauto2_milp.config import load_config  # type: ignore
 else:
     from .app import DEFAULT_CONFIG_PATH, import_problem_impl, run as app_run
     from .config import load_config
@@ -17,8 +17,8 @@ else:
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="mobauto2-benders",
-        description="Benders decomposition runner for MobAuto2",
+        prog="mobauto2-milp",
+        description="Monolithic MILP runner for MobAuto2",
     )
     p.add_argument(
         "--config",
@@ -29,26 +29,13 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd")
     sub.required = False
 
-    run_p = sub.add_parser("run", help="Run the Benders solver loop")
+    run_p = sub.add_parser("run", help="Run the integrated MILP model")
     run_p.add_argument(
         "--multi-res",
         dest="multi_res",
         type=str,
         default=None,
         help="Comma-separated slot resolutions to run coarse-to-fine, e.g. '30,15,5,1'",
-    )
-    run_p.add_argument(
-        "--mw",
-        dest="mw",
-        action="store_true",
-        help="Enable Magnanti–Wong (Pareto-optimal) cut selection",
-    )
-    run_p.add_argument(
-        "--mw-alpha",
-        dest="mw_alpha",
-        type=float,
-        default=None,
-        help="Core-point mixing factor alpha in (0,1]; default from config or 0.3",
     )
     sub.add_parser("validate", help="Validate config and problem stubs")
     sub.add_parser("info", help="Show current configuration")
@@ -65,10 +52,6 @@ def _parse_multi_res(value: str | None) -> list[int] | None:
 def cmd_run(args) -> int:
     overrides: dict = {"emit_cli_output": True}
 
-    if getattr(args, "mw", False):
-        overrides.setdefault("subproblem_params", {})["use_magnanti_wong"] = True
-    if getattr(args, "mw_alpha", None) is not None:
-        overrides.setdefault("subproblem_params", {})["mw_core_alpha"] = float(args.mw_alpha)
     if getattr(args, "multi_res", None):
         seq = _parse_multi_res(args.multi_res)
         if not seq:
@@ -111,8 +94,8 @@ def _print_config_summary(cfg) -> None:
     if cfg.data.scenario_weights:
         print(f"Data: scenario_weights={cfg.data.scenario_weights}")
     print(
-        "Solver: max_iterations=%s tolerance=%s time_limit_s=%s"
-        % (cfg.solver.max_iterations, cfg.solver.tolerance, cfg.solver.time_limit_s)
+        "Solver: backend=%s time_limit_s=%s mipgap=%s"
+        % (cfg.milp.solver_backend, cfg.milp.solve_time_limit_s, cfg.milp.mipgap)
     )
 
 

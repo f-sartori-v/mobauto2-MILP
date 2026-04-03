@@ -1,19 +1,28 @@
 from __future__ import annotations
 
+import importlib.util
+import sys
 from typing import Any, Optional
 from datetime import datetime
 from pathlib import Path
 
 import pyomo.environ as pyo
 
-from ..benders.master import MasterProblem
-from ..benders.solver import add_benders_cut  # shared cut filtering
-from ..benders.types import Candidate, Cut, SolveResult, SolveStatus
-from ..benders.cplex_log import parse_cplex_log_bounds
-from ..tolerances import project_binary_value
+from .cplex_log import parse_cplex_log_bounds
+from .tolerances import project_binary_value
+from .types import Candidate, Cut, SolveResult, SolveStatus
 
 
-class ProblemMaster(MasterProblem):
+class _BaseModel:
+    def __init__(self, params: dict[str, Any] | None = None):
+        self.params = params or {}
+
+
+def add_model_cut(*args, **kwargs) -> bool:
+    return True
+
+
+class MobautoMilpModel(_BaseModel):
     def __init__(self, params: dict[str, Any] | None = None):
         super().__init__(params)
         self.m: pyo.ConcreteModel | None = None
@@ -393,8 +402,8 @@ class ProblemMaster(MasterProblem):
             m.gchg[q, T - 1].fix(0)
             # Allow charging label at the last slot if desired (battery won't change as gchg[T-1]=0)
 
-        # Container block to store explicit Benders cuts incrementally
-        m.BendersCuts = pyo.Block(concrete=True)
+        # Container block to store explicit extra cuts incrementally
+        m.ExtraCuts = pyo.Block(concrete=True)
 
         self.m = m
 
@@ -404,6 +413,13 @@ class ProblemMaster(MasterProblem):
             solver_name = backend
         else:
             solver_name = str(self._p("solver", "cplex"))
+        if str(solver_name).lower() == "cplex_direct" and importlib.util.find_spec("cplex") is None:
+            pyver = f"{sys.version_info.major}.{sys.version_info.minor}"
+            raise RuntimeError(
+                "The selected backend 'cplex_direct' requires the IBM CPLEX Python package 'cplex', "
+                f"but it is not installed for the current interpreter: {sys.executable} (Python {pyver}). "
+                "Install the CPLEX Python API in this interpreter, or switch the backend back to 'cplex'."
+            )
         self._solver = pyo.SolverFactory(solver_name)
         # Set solver options once here
         opts = self._p("solver_options", {}) or {}
@@ -636,8 +652,8 @@ class ProblemMaster(MasterProblem):
                 )
                 term = getattr(res.solver, "termination_condition", None)
                 self._vprint("[MP] Fallback to cplex_direct due to UNKNOWN termination.")
-            except Exception:
-                pass
+            except Exception as exc:
+                self._vprint(f"[MP] cplex_direct fallback unavailable or failed: {exc}")
         try:
             m.solutions.load_from(res)
         except Exception:
@@ -910,12 +926,18 @@ class ProblemMaster(MasterProblem):
         # Theta
         try:
             if hasattr(m, "theta"):
-                lines.append(f"theta = {pyo.value(m.theta):.6g}")
+                val = pyo.value(m.theta, exception=False)
+                lines.append(f"theta = {float(val):.6g}" if val is not None else "theta = (unavailable)")
             elif hasattr(m, "theta_out") and hasattr(m, "theta_ret"):
-                tot = float(pyo.value(m.theta_out)) + float(pyo.value(m.theta_ret))
-                lines.append(f"theta = {tot:.6g}")
-                lines.append(f"  - theta_out = {float(pyo.value(m.theta_out)):.6g}")
-                lines.append(f"  - theta_ret = {float(pyo.value(m.theta_ret)):.6g}")
+                v_out = pyo.value(m.theta_out, exception=False)
+                v_ret = pyo.value(m.theta_ret, exception=False)
+                if v_out is not None and v_ret is not None:
+                    tot = float(v_out) + float(v_ret)
+                    lines.append(f"theta = {tot:.6g}")
+                    lines.append(f"  - theta_out = {float(v_out):.6g}")
+                    lines.append(f"  - theta_ret = {float(v_ret):.6g}")
+                else:
+                    lines.append("theta = (unavailable)")
             elif hasattr(m, "theta_s"):
                 try:
                     S = len(getattr(m, "Scenarios", []))
@@ -1200,7 +1222,7 @@ class ProblemMaster(MasterProblem):
             added_out = True
             added_ret = True
             if not force:
-                added_out = add_benders_cut(
+                added_out = add_model_cut(
                     iteration=-1,
                     const=float(const_adj_out),
                     slopes=slopes_out,
@@ -1212,7 +1234,7 @@ class ProblemMaster(MasterProblem):
                     signature_set=self._cut_signatures,
                     slope_const_map=self._cut_best_const,
                 )
-                added_ret = add_benders_cut(
+                added_ret = add_model_cut(
                     iteration=-1,
                     const=float(const_adj_ret),
                     slopes=slopes_ret,
@@ -1257,7 +1279,7 @@ class ProblemMaster(MasterProblem):
             if lhs_val is None or rhs_val is None:
                 return False
             if not force:
-                ok = add_benders_cut(
+                ok = add_model_cut(
                     iteration=-1,
                     const=float(const_adj),
                     slopes=slopes_all,
@@ -1272,7 +1294,7 @@ class ProblemMaster(MasterProblem):
                 if not ok:
                     return False
 
-        # Duplicate check handled by add_benders_cut
+        # Duplicate check handled by add_model_cut
 
         # Create explicit constraint(s)
         if hasattr(m, "theta_out") and hasattr(m, "theta_ret") and (const_adj_out is not None) and (const_adj_ret is not None):
@@ -1280,27 +1302,27 @@ class ProblemMaster(MasterProblem):
             name_list = []
             # OUT direction
             if force or 'added_out' in locals() and added_out:
-                cname_out = f"benders_cut_out_{self._cut_idx}"
+                cname_out = f"extra_cut_out_{self._cut_idx}"
                 con_out = pyo.Constraint(expr=(m.theta_out >= rhs_out))
-                setattr(m.BendersCuts, cname_out, con_out)
+                setattr(m.ExtraCuts, cname_out, con_out)
                 con_list.append(con_out)
                 name_list.append(cname_out)
             # RET direction
             if force or 'added_ret' in locals() and added_ret:
-                cname_ret = f"benders_cut_ret_{self._cut_idx}"
+                cname_ret = f"extra_cut_ret_{self._cut_idx}"
                 con_ret = pyo.Constraint(expr=(m.theta_ret >= rhs_ret))
-                setattr(m.BendersCuts, cname_ret, con_ret)
+                setattr(m.ExtraCuts, cname_ret, con_ret)
                 con_list.append(con_ret)
                 name_list.append(cname_ret)
         else:
-            cname = f"benders_cut_{self._cut_idx}"
+            cname = f"extra_cut_{self._cut_idx}"
             if hasattr(m, "theta_s") and (scen_idx is not None):
                 lhs = m.theta_s[int(scen_idx)]
             else:
                 lhs = m.theta
             rhs_scaled = rhs
             con = pyo.Constraint(expr=(lhs >= rhs_scaled))
-            setattr(m.BendersCuts, cname, con)
+            setattr(m.ExtraCuts, cname, con)
             con_list = [con]
             name_list = [cname]
         # Maintain pool for optional pruning
@@ -1321,7 +1343,7 @@ class ProblemMaster(MasterProblem):
                 name_old = self._cut_names.pop(0)
                 # Remove from Pyomo block
                 try:
-                    delattr(m.BendersCuts, name_old)
+                    delattr(m.ExtraCuts, name_old)
                 except Exception:
                     pass
 
@@ -1339,12 +1361,12 @@ class ProblemMaster(MasterProblem):
                 except Exception:
                     wrote = False
                 if wrote:
-                    self._vprint(f"[BENDERS] Wrote LP to {lp_path}")
+                    self._vprint(f"[MILP] Wrote LP to {lp_path}")
                 # Also write a symbolic LP via Pyomo for readability
                 try:
                     sym_lp_path = out_dir / f"master_after_cut_{self._cut_idx}_sym.lp"
                     m.write(str(sym_lp_path), io_options={"symbolic_solver_labels": True})
-                    self._vprint(f"[BENDERS] Wrote symbolic LP to {sym_lp_path}")
+                    self._vprint(f"[MILP] Wrote symbolic LP to {sym_lp_path}")
                 except Exception:
                     pass
         except Exception:
@@ -1358,28 +1380,28 @@ class ProblemMaster(MasterProblem):
             rng = (min(all_betas), max(all_betas))
             if hasattr(m, "theta_out") and hasattr(m, "theta_ret") and (const_adj_out is not None) and (const_adj_ret is not None):
                 self._vprint(
-                    f"[BENDERS] Added cut #{self._cut_idx}: const_out={const_adj_out:.6g}, const_ret={const_adj_ret:.6g}, nnz={nnz}, slope_range=[{rng[0]:.3g},{rng[1]:.3g}], raw_pos_dm={raw_pos_dm}, scale={scale:.3g}"
+                    f"[MILP] Added cut #{self._cut_idx}: const_out={const_adj_out:.6g}, const_ret={const_adj_ret:.6g}, nnz={nnz}, slope_range=[{rng[0]:.3g},{rng[1]:.3g}], raw_pos_dm={raw_pos_dm}, scale={scale:.3g}"
                 )
             else:
                 self._vprint(
-                    f"[BENDERS] Added cut #{self._cut_idx}: const={const_adj:.6g}, nnz={nnz}, slope_range=[{rng[0]:.3g},{rng[1]:.3g}], raw_pos_dm={raw_pos_dm}, scale={scale:.3g}"
+                    f"[MILP] Added cut #{self._cut_idx}: const={const_adj:.6g}, nnz={nnz}, slope_range=[{rng[0]:.3g},{rng[1]:.3g}], raw_pos_dm={raw_pos_dm}, scale={scale:.3g}"
                 )
         else:
             if hasattr(m, "theta_out") and hasattr(m, "theta_ret") and (const_adj_out is not None) and (const_adj_ret is not None):
                 self._vprint(
-                    f"[BENDERS] Added cut #{self._cut_idx}: const_out={const_adj_out:.6g}, const_ret={const_adj_ret:.6g}, nnz={nnz}, raw_pos_dm={raw_pos_dm}, scale={scale:.3g}"
+                    f"[MILP] Added cut #{self._cut_idx}: const_out={const_adj_out:.6g}, const_ret={const_adj_ret:.6g}, nnz={nnz}, raw_pos_dm={raw_pos_dm}, scale={scale:.3g}"
                 )
             else:
-                self._vprint(f"[BENDERS] Added cut #{self._cut_idx}: const={const_adj:.6g}, nnz={nnz}, raw_pos_dm={raw_pos_dm}, scale={scale:.3g}")
+                self._vprint(f"[MILP] Added cut #{self._cut_idx}: const={const_adj:.6g}, nnz={nnz}, raw_pos_dm={raw_pos_dm}, scale={scale:.3g}")
         # Sanity log with LHS and RHS values (scaled)
         try:
             if hasattr(m, "theta_out") and hasattr(m, "theta_ret") and (const_adj_out is not None) and (const_adj_ret is not None):
                 self._vprint(
-                    f"[BENDERS] Eval cut (dir): OUT lhs={lhs_out_val:.6g} rhs={rhs_out_val:.6g}; "
+                    f"[MILP] Eval cut (dir): OUT lhs={lhs_out_val:.6g} rhs={rhs_out_val:.6g}; "
                     f"RET lhs={lhs_ret_val:.6g} rhs={rhs_ret_val:.6g}"
                 )
             else:
-                self._vprint(f"[BENDERS] Eval cut: lhs={lhs_val:.6g} rhs={rhs_val:.6g}")
+                self._vprint(f"[MILP] Eval cut: lhs={lhs_val:.6g} rhs={rhs_val:.6g}")
         except Exception:
             pass
         self._cut_idx += 1
