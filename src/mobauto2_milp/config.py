@@ -37,6 +37,7 @@ class RunSection:
 @dataclass(slots=True)
 class DataSection:
     demand_file: str | None = None
+    demand_files: list[str] = field(default_factory=list)
     scenario_files: list[str] = field(default_factory=list)
     scenario_weights: list[float] | None = None
     R_out: list[float] | None = None
@@ -252,6 +253,14 @@ def _ensure_str_list(value: Any, where: str) -> list[str]:
     return list(value)
 
 
+def _ensure_str_or_str_list(value: Any, where: str) -> str | list[str]:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list) and all(isinstance(v, str) for v in value):
+        return list(value)
+    raise ValueError(f"{where} must be a string or a list of strings")
+
+
 def _ensure_num_list(value: Any, where: str) -> list[float]:
     if value is None:
         return []
@@ -342,6 +351,7 @@ def upgrade_config_v1_to_v2(old: Mapping[str, Any]) -> dict[str, Any]:
         },
         "data": {
             "demand_file": sub_params.get("demand_file"),
+            "demand_files": sub_params.get("demand_files") or [],
             "scenario_files": sub_params.get("scenario_files") or [],
             "scenario_weights": sub_params.get("scenario_weights"),
             "R_out": sub_params.get("R_out"),
@@ -439,13 +449,26 @@ def _parse_v3(raw: Mapping[str, Any]) -> RootConfig:
     data_raw = _as_mapping(data.get("data"), "data")
     _check_unknown_keys(
         data_raw,
-        {"demand_file", "scenario_files", "scenario_weights", "R_out", "R_ret", "scenarios"},
+        {"demand_file", "demand_files", "scenario_files", "scenario_weights", "R_out", "R_ret", "scenarios"},
         "data",
     )
     demand_file_val = data_raw.get("demand_file")
+    demand_file_parsed: str | list[str] | None = None
+    if demand_file_val is not None:
+        demand_file_parsed = _ensure_str_or_str_list(demand_file_val, "data.demand_file")
+    scenario_files_val = _ensure_str_list(data_raw.get("scenario_files"), "data.scenario_files")
+    if isinstance(demand_file_parsed, list):
+        if scenario_files_val:
+            raise ValueError(
+                "data.demand_file cannot be a list when data.scenario_files is also provided; "
+                "use only data.scenario_files for multiple scenarios"
+            )
+        scenario_files_val = list(demand_file_parsed)
+        demand_file_parsed = None
     data_section = DataSection(
-        demand_file=(_ensure_str(demand_file_val, "data.demand_file") if demand_file_val is not None else None),
-        scenario_files=_ensure_str_list(data_raw.get("scenario_files"), "data.scenario_files"),
+        demand_file=(str(demand_file_parsed) if isinstance(demand_file_parsed, str) else None),
+        demand_files=_ensure_str_list(data_raw.get("demand_files"), "data.demand_files"),
+        scenario_files=scenario_files_val,
         scenario_weights=(
             _ensure_num_list(data_raw.get("scenario_weights"), "data.scenario_weights")
             if data_raw.get("scenario_weights") is not None

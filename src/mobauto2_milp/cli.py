@@ -89,6 +89,8 @@ def _print_config_summary(cfg) -> None:
     print(f"Schema: {cfg.schema.name} v{cfg.schema.version}")
     demand = cfg.data.demand_file or ("inline R_out/R_ret" if cfg.data.R_out or cfg.data.R_ret else "none")
     print(f"Data: demand={demand}")
+    if cfg.data.demand_files:
+        print(f"Data: demand_files={len(cfg.data.demand_files)}")
     if cfg.data.scenario_files:
         print(f"Data: scenario_files={len(cfg.data.scenario_files)}")
     if cfg.data.scenario_weights:

@@ -46,11 +46,11 @@ class MobautoMilpModel(_BaseModel):
             return default
         return self.params.get(key, default)
 
-    def _is_report(self) -> bool:
-        return str(self._p("log_level", "")).upper() == "REPORT"
+    def _is_quiet_run(self) -> bool:
+        return str(self._p("log_level", "")).upper() in {"REPORT", "FINAL"}
 
     def _vprint(self, *args, **kwargs) -> None:
-        if not self._is_report():
+        if not self._is_quiet_run():
             print(*args, **kwargs)
 
     def _extract_solver_stats(self, res) -> dict[str, Any]:
@@ -148,7 +148,8 @@ class MobautoMilpModel(_BaseModel):
             except Exception:
                 initial_actions = ["IDL"] * Q
             if len(initial_actions) < Q:
-                initial_actions = initial_actions + ["IDL"] * (Q - len(initial_actions))
+                fill = initial_actions[-1] if initial_actions else "IDL"
+                initial_actions = initial_actions + [fill] * (Q - len(initial_actions))
             elif len(initial_actions) > Q:
                 initial_actions = initial_actions[:Q]
         allowed_initial_actions = {"IDL", "CHR", "OUT", "RET"}
@@ -442,19 +443,28 @@ class MobautoMilpModel(_BaseModel):
         tee_flag = bool(self._p("solver_tee", self._p("mp_solve_tee", False)))
         emit_reports = bool(self._p("emit_reports", True))
         # Per-iteration solver controls
+        solve_timelimit = None
         try:
             time_limit = self._p("solve_time_limit_s")
             if time_limit is not None:
-                solver.options["timelimit"] = float(time_limit)
+                solve_timelimit = float(time_limit)
+                solver.options["timelimit"] = solve_timelimit
             mipgap = self._p("mipgap")
             if mipgap is not None:
                 solver.options["mipgap"] = float(mipgap)
             cplex_opts = self._p("cplex_options", {}) or {}
             backend = str(self._p("solver_backend", "")).lower()
-            # CPLEX file-based plugin accepts CPXPARAM_* keys; cplex_direct does not.
+            # Pyomo's file-based CPLEX plugin writes options to the interactive shell.
+            # Convert C API-style CPXPARAM_* names to shell parameter paths.
             if backend in ("cplex", ""):
                 for k, v in cplex_opts.items():
-                    solver.options[k] = v
+                    opt_name = str(k)
+                    opt_upper = opt_name.upper()
+                    if opt_upper == "CPXPARAM_MIP_STRATEGY_SYMMETRY":
+                        opt_name = "preprocessing symmetry"
+                    elif opt_upper.startswith("CPXPARAM_"):
+                        opt_name = opt_name[len("CPXPARAM_") :].replace("_", " ").lower()
+                    solver.options[opt_name] = v
             else:
                 # Skip CPXPARAM_* for cplex_direct to avoid AttributeError.
                 for k, v in cplex_opts.items():
@@ -600,6 +610,7 @@ class MobautoMilpModel(_BaseModel):
             load_solutions=False,
             keepfiles=bool(emit_reports),
             symbolic_solver_labels=True,
+            timelimit=solve_timelimit,
         )
         term = getattr(res.solver, "termination_condition", None)
         if term in (pyo.TerminationCondition.optimal, pyo.TerminationCondition.feasible, pyo.TerminationCondition.maxTimeLimit):
@@ -614,6 +625,7 @@ class MobautoMilpModel(_BaseModel):
                     load_solutions=True,
                     keepfiles=bool(emit_reports),
                     symbolic_solver_labels=True,
+                    timelimit=solve_timelimit,
                 )
         # Try to capture the actual solver log path (including temp log from direct interfaces)
         try:
@@ -633,6 +645,14 @@ class MobautoMilpModel(_BaseModel):
         if term not in (pyo.TerminationCondition.optimal, pyo.TerminationCondition.feasible, pyo.TerminationCondition.maxTimeLimit) and backend in ("cplex", ""):
             try:
                 fallback = pyo.SolverFactory("cplex_direct")
+                if solve_timelimit is not None:
+                    fallback.options["timelimit"] = solve_timelimit
+                try:
+                    mipgap = self._p("mipgap")
+                    if mipgap is not None:
+                        fallback.options["mipgap"] = float(mipgap)
+                except Exception:
+                    pass
                 # Apply options compatible with cplex_direct
                 try:
                     cplex_opts = self._p("cplex_options", {}) or {}
@@ -644,11 +664,12 @@ class MobautoMilpModel(_BaseModel):
                     pass
                 res = fallback.solve(
                     m,
-                    tee=True,
+                    tee=bool(tee_flag and emit_reports),
                     warmstart=use_ws,
                     load_solutions=True,
-                    keepfiles=True,
+                    keepfiles=bool(emit_reports),
                     symbolic_solver_labels=True,
+                    timelimit=solve_timelimit,
                 )
                 term = getattr(res.solver, "termination_condition", None)
                 self._vprint("[MP] Fallback to cplex_direct due to UNKNOWN termination.")
@@ -923,6 +944,7 @@ class MobautoMilpModel(_BaseModel):
         T = list(m.T)
         lines: list[str] = []
         lines.append(f"Q={len(Q)} T={len(T)}")
+
         # Theta
         try:
             if hasattr(m, "theta"):
@@ -1349,7 +1371,7 @@ class MobautoMilpModel(_BaseModel):
 
         # Optional: export MP LP after adding a cut for inspection
         try:
-            if bool(self._p("write_lp_after_cut", False)) and (not self._is_report()):
+            if bool(self._p("write_lp_after_cut", False)) and (not self._is_quiet_run()):
                 out_dir = Path(self._p("lp_output_dir", "Report"))
                 out_dir.mkdir(parents=True, exist_ok=True)
                 lp_path = out_dir / f"master_after_cut_{self._cut_idx}.lp"

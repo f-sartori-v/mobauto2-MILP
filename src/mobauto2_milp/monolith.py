@@ -4,6 +4,7 @@ import json
 import math
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,7 @@ class MonolithSolver:
             self._Wmax = int(self.subproblem_params.get("Wmax_slots", self.subproblem_params.get("Wmax", 0)))
 
     def run(self) -> RunResult:
+        started_at = datetime.now()
         t0 = time.perf_counter()
         self.master.initialize()
         assert self.master.m is not None
@@ -85,6 +87,8 @@ class MonolithSolver:
                     "the service variables for an incumbent solution."
                 )
             }
+        finished_at = datetime.now()
+        elapsed_wall_s = self._last_stats.get("elapsed_wall_s")
 
         return RunResult(
             status=solve_result.status,
@@ -100,6 +104,9 @@ class MonolithSolver:
             sp_penalty_pax=diagnostics.get("sp_penalty_pax"),
             sp_total_demand=diagnostics.get("sp_total_demand"),
             sp_slot_resolution=self._slot_resolution,
+            solve_started_at=started_at,
+            solve_finished_at=finished_at,
+            elapsed_wall_s=float(elapsed_wall_s) if elapsed_wall_s is not None else None,
         )
 
     def format_solution(self) -> str:

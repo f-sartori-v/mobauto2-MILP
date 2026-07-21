@@ -45,7 +45,7 @@ class _StdoutTee:
 def setup_logging(level: str = "INFO") -> None:
     fmt = "%(asctime)s %(levelname)s | %(name)s | %(message)s"
     lvl_name = str(level).upper()
-    if lvl_name == "REPORT":
+    if lvl_name in {"REPORT", "FINAL"}:
         lvl = logging.ERROR
     else:
         lvl = getattr(logging, lvl_name, logging.INFO)

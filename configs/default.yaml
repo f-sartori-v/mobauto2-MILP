@@ -4,21 +4,26 @@ schema:
 
 run:
   name: default
-  log_level: INFO
+  log_level: FINAL
   seed: 42
 
 data:
-  demand_file: setups/base.yaml
+  #demand_file: setups/base.yaml
+  # For batch runs, use mobauto2-milp run with:
+  demand_files:
+    - setups/generated_demands/base200.yaml
+
+  #scenario_files: [setups/base.yaml, setups/base_plus100_out_noon.yaml, setups/base_ret_peak_adv.yaml, setups/base_vol20_pm60.yaml]
 
 model:
   time:
-    T_minutes: 660
-    slot_resolution: 1
+    T_minutes: 420
+    slot_resolution: 30
     trip_duration_minutes: 30
   fleet:
-    Q: 3
-    initial_battery: [150.0, 150.0, 150.0]
-    initial_actions: [IDL, IDL, IDL]
+    Q: 200
+    initial_battery: [150.0]
+    initial_actions: [IDL]
   energy:
     Emax: 150
     L: 30
@@ -31,15 +36,15 @@ milp:
   use_fifo_symmetry: true
   symmetry_breaking: true
   use_mip_start: true
-  solve_time_limit_s: 36000
+  solve_time_limit_s: 3600
   mipgap: 0.01
-  solver_backend: cplex_direct
+  solver_backend: cplex
   cplex_options:
     CPXPARAM_MIP_Strategy_Symmetry: 5
     CPXPARAM_Threads: 0
 
 service:
-  S: 15
+  S: 12
   Wmax_minutes: 60
   p: 50.0
   fill_first_epsilon: 1.0e-6

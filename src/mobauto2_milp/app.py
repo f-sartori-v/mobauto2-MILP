@@ -1,11 +1,22 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+from contextlib import redirect_stderr, redirect_stdout
+import copy
 from pathlib import Path
+import subprocess
+import sys
 
 from .config import DEFAULT_CONFIG_PATH, load_config, resolve_energy_params
 from .logging_config import setup_logging
 from .monolith import MonolithSolver
 from .solver import RunResult
+
+
+_QUIET_RUN_LEVELS = {"REPORT", "FINAL"}
+
+
+def _run_level(cfg) -> str:
+    return str(cfg.run.log_level).upper()
 
 
 def import_problem_impl():
@@ -98,7 +109,7 @@ def _prepare_params(cfg, overrides: dict | None) -> tuple[dict, dict]:
     mp["solver"] = str(cfg.milp.solver_backend)
     mp["solver_tee"] = bool(cfg.solver.solver_tee)
     mp["log_level"] = str(cfg.run.log_level)
-    mp["emit_reports"] = str(cfg.run.log_level).upper() != "REPORT"
+    mp["emit_reports"] = _run_level(cfg) not in _QUIET_RUN_LEVELS
 
     sp["lp_solver"] = str(cfg.milp.solver_backend)
     sp["multi_cuts_by_scenario"] = False
@@ -223,6 +234,15 @@ def _print_cfg(cfg, mp: dict, sp: dict) -> None:
 
 def _maybe_print_summary(result: RunResult, sp: dict) -> None:
     try:
+        if result.solve_started_at is not None and result.solve_finished_at is not None:
+            started = result.solve_started_at.strftime("%Y-%m-%d %H:%M:%S")
+            finished = result.solve_finished_at.strftime("%Y-%m-%d %H:%M:%S")
+            elapsed = (
+                f"{float(result.elapsed_wall_s):.3f}s"
+                if result.elapsed_wall_s is not None
+                else f"{(result.solve_finished_at - result.solve_started_at).total_seconds():.3f}s"
+            )
+            print(f"Solver time: start={started} end={finished} elapsed={elapsed}")
         if result.pax_served is not None and result.pax_total is not None:
             print(f"Pax served: {result.pax_served:.0f}/{result.pax_total:.0f}")
         if result.subproblem_obj is not None:
@@ -313,6 +333,7 @@ def _run_single(
     emit_cli_output: bool,
     warm_start: dict | None = None,
     emit_summary: bool = True,
+    emit_detailed_report: bool = True,
 ):
     model_cls = import_problem_impl()
     solver = MonolithSolver(model_cls, cfg, mp, sp)
@@ -334,15 +355,92 @@ def _run_single(
                 pass
         else:
             print("\nNo incumbent solution loaded; detailed schedule is unavailable.")
-        try:
-            report = solver.format_report()
-            if report:
-                print("")
-                print(report)
-        except Exception:
-            pass
+        if emit_detailed_report:
+            try:
+                report = solver.format_report()
+                if report:
+                    print("")
+                    print(report)
+            except Exception:
+                pass
     return result, solver.master
 
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _path_from_project_root(project_root: Path, path: str | Path) -> Path:
+    p = Path(path)
+    return p if p.is_absolute() else project_root / p
+
+
+def get_demand_file_list(cfg) -> list[str]:
+    if getattr(cfg.data, "demand_files", None):
+        return [str(p) for p in cfg.data.demand_files]
+    if getattr(cfg.data, "demand_file", None):
+        return [str(cfg.data.demand_file)]
+    raise ValueError("Config must contain either data.demand_file or data.demand_files.")
+
+
+def _plot_solver_output(project_root: Path, demand_file: str, solver_output_path: Path, scenario_dir: Path) -> None:
+    plot_script = project_root / "aux_py" / "plot_figs.py"
+    if not plot_script.exists():
+        print(f"WARNING: plot_figs.py not found at {plot_script}")
+        return
+    subprocess.run(
+        [
+            sys.executable,
+            str(plot_script),
+            "--demand-file",
+            str(_path_from_project_root(project_root, demand_file)),
+            "--solver-output",
+            str(solver_output_path),
+            "--out-dir",
+            str(scenario_dir),
+        ],
+        cwd=project_root,
+        check=True,
+    )
+
+
+def _run_batch_demands(cfg, config_path: str | Path | None, overrides: dict | None) -> RunResult:
+    project_root = _project_root()
+    last_result: RunResult | None = None
+
+    for demand_file in get_demand_file_list(cfg):
+        scenario_name = Path(demand_file).stem
+        scenario_dir = project_root / "outputs" / "demand_variations" / scenario_name
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+        solver_output_path = scenario_dir / "solver-output"
+
+        print(f"\n=== Running scenario: {scenario_name} ===", flush=True)
+        print(f"Demand file: {demand_file}", flush=True)
+        print(f"Output folder: {scenario_dir}", flush=True)
+
+        run_cfg = copy.deepcopy(cfg)
+        run_cfg.data.demand_file = demand_file
+        run_cfg.data.demand_files = []
+
+        mp, sp = _prepare_params(run_cfg, overrides)
+        emit_cli_output = True
+        emit_detailed_report = _run_level(run_cfg) != "FINAL"
+
+        with solver_output_path.open("w", encoding="utf-8") as f:
+            with redirect_stdout(f), redirect_stderr(f):
+                result, _master = _run_single(
+                    run_cfg,
+                    mp,
+                    sp,
+                    emit_cli_output,
+                    emit_detailed_report=emit_detailed_report,
+                )
+        last_result = result
+        _plot_solver_output(project_root, demand_file, solver_output_path, scenario_dir)
+
+    if last_result is None:
+        raise ValueError("No demand files were run.")
+    return last_result
 
 def run(config_path: str | Path | None = None, overrides: dict | None = None) -> RunResult:
     """Run the monolithic MILP solver with a single canonical execution path.
@@ -352,7 +450,12 @@ def run(config_path: str | Path | None = None, overrides: dict | None = None) ->
     cfg = load_config(config_path)
     _apply_run_overrides(cfg, overrides)
     setup_logging(cfg.run.log_level)
-    report_mode = str(cfg.run.log_level).upper() == "REPORT"
+    log_level = _run_level(cfg)
+    report_mode = log_level in _QUIET_RUN_LEVELS
+    emit_detailed_report = log_level != "FINAL"
+
+    if cfg.data.demand_files:
+        return _run_batch_demands(cfg, config_path, overrides)
 
     mp_base, sp_base = _prepare_params(cfg, overrides)
     emit_cli_output = bool(overrides.get("emit_cli_output")) if overrides else False
@@ -399,6 +502,7 @@ def run(config_path: str | Path | None = None, overrides: dict | None = None) ->
                 emit_cli_output,
                 warm_start=warm_start,
                 emit_summary=False,
+                emit_detailed_report=emit_detailed_report,
             )
             last_result = result
             if emit_cli_output:
@@ -417,7 +521,13 @@ def run(config_path: str | Path | None = None, overrides: dict | None = None) ->
             raise ValueError("Multi-res run produced no results.")
         return last_result
 
-    result, _master = _run_single(cfg, mp_base, sp_base, emit_cli_output)
+    result, _master = _run_single(
+        cfg,
+        mp_base,
+        sp_base,
+        emit_cli_output,
+        emit_detailed_report=emit_detailed_report,
+    )
     return result
 
 

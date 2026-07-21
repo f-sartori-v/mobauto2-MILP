@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from datetime import datetime
 from typing import Optional
 
 
@@ -28,6 +29,9 @@ class RunResult:
     sp_penalty_pax: Optional[float] = None
     sp_total_demand: Optional[float] = None
     sp_slot_resolution: Optional[int] = None
+    solve_started_at: Optional[datetime] = None
+    solve_finished_at: Optional[datetime] = None
+    elapsed_wall_s: Optional[float] = None
 
 
 __all__ = ["RunResult", "SolveStatus"]
